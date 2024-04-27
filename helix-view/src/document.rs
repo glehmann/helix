@@ -1030,7 +1030,9 @@ impl Document {
                     if force {
                         std::fs::DirBuilder::new().recursive(true).create(parent)?;
                     } else {
-                        bail!("can't save file, parent directory does not exist (use :w! to create it)");
+                        bail!(
+                            "can't save file, parent directory does not exist (use :w! to create it)"
+                        );
                     }
                 }
             }
@@ -1244,12 +1246,18 @@ impl Document {
                 Ok(metadata) => match metadata.modified() {
                     Ok(mtime) => mtime,
                     Err(err) => {
-                        log::debug!("Could not fetch file system's mtime, falling back to current system time: {}", err);
+                        log::debug!(
+                            "Could not fetch file system's mtime, falling back to current system time: {}",
+                            err
+                        );
                         SystemTime::now()
                     }
                 },
                 Err(err) => {
-                    log::debug!("Could not fetch file system's mtime, falling back to current system time: {}", err);
+                    log::debug!(
+                        "Could not fetch file system's mtime, falling back to current system time: {}",
+                        err
+                    );
                     SystemTime::now()
                 }
             },
@@ -1270,7 +1278,7 @@ impl Document {
     pub fn reload(
         &mut self,
         view: &mut View,
-        provider_registry: &DiffProviderRegistry,
+        provider_registry: &mut DiffProviderRegistry,
     ) -> Result<(), Error> {
         let encoding = self.encoding;
         let path = match self.path() {
@@ -1280,6 +1288,8 @@ impl Document {
                 false => bail!("can't find file to reload from {:?}", self.display_name()),
             },
         };
+
+        provider_registry.reload(&path);
 
         // Once we have a valid path we check if its readonly status has changed
         self.detect_readonly();
