@@ -1597,11 +1597,13 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
         .map(|_| {
             view.ensure_cursor_in_view(doc, scrolloff);
         })?;
-    if let Some(path) = doc.path().map(ToOwned::to_owned) {
-        cx.editor
-            .language_servers
-            .file_event_handler
-            .file_changed(path);
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        if let Some(path) = doc.path().map(ToOwned::to_owned) {
+            cx.editor
+                .language_servers
+                .file_event_handler
+                .file_changed(path);
+        }
     }
     Ok(())
 }
@@ -1652,11 +1654,13 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
             continue;
         }
 
-        if let Some(path) = doc.path().map(ToOwned::to_owned) {
-            cx.editor
-                .language_servers
-                .file_event_handler
-                .file_changed(path);
+        if !cfg!(any(target_os = "linux", target_os = "android")) {
+            if let Some(path) = doc.path().map(ToOwned::to_owned) {
+                cx.editor
+                    .language_servers
+                    .file_event_handler
+                    .file_changed(path);
+            }
         }
 
         for view_id in view_ids {
@@ -4091,7 +4095,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         doc: "Allow language servers and local config for the current workspace.",
         fun: trust_workspace,
         completer: CommandCompleter::none(),
-        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
+        signature: Signature {
+            positionals: (0, None),
+            ..Signature::DEFAULT
+        },
     },
     TypableCommand {
         name: "workspace-untrust",
