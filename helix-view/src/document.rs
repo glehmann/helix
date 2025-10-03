@@ -190,7 +190,7 @@ pub struct Document {
 
     // Last time we wrote to the file. This will carry the time the file was last opened if there
     // were no saves.
-    last_saved_time: SystemTime,
+    pub last_saved_time: SystemTime,
 
     last_saved_revision: usize,
     version: i32, // should be usize?
@@ -1030,7 +1030,9 @@ impl Document {
                     if force {
                         std::fs::DirBuilder::new().recursive(true).create(parent)?;
                     } else {
-                        bail!("can't save file, parent directory does not exist (use :w! to create it)");
+                        bail!(
+                            "can't save file, parent directory does not exist (use :w! to create it)"
+                        );
                     }
                 }
             }
@@ -1244,12 +1246,18 @@ impl Document {
                 Ok(metadata) => match metadata.modified() {
                     Ok(mtime) => mtime,
                     Err(err) => {
-                        log::debug!("Could not fetch file system's mtime, falling back to current system time: {}", err);
+                        log::debug!(
+                            "Could not fetch file system's mtime, falling back to current system time: {}",
+                            err
+                        );
                         SystemTime::now()
                     }
                 },
                 Err(err) => {
-                    log::debug!("Could not fetch file system's mtime, falling back to current system time: {}", err);
+                    log::debug!(
+                        "Could not fetch file system's mtime, falling back to current system time: {}",
+                        err
+                    );
                     SystemTime::now()
                 }
             },

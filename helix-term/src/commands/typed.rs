@@ -1511,11 +1511,13 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
     doc.reload(view, &cx.editor.diff_providers).map(|_| {
         view.ensure_cursor_in_view(doc, scrolloff);
     })?;
-    if let Some(path) = doc.path().map(ToOwned::to_owned) {
-        cx.editor
-            .language_servers
-            .file_event_handler
-            .file_changed(path);
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        if let Some(path) = doc.path().map(ToOwned::to_owned) {
+            cx.editor
+                .language_servers
+                .file_event_handler
+                .file_changed(path);
+        }
     }
     Ok(())
 }
@@ -1557,11 +1559,13 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
             continue;
         }
 
-        if let Some(path) = doc.path().map(ToOwned::to_owned) {
-            cx.editor
-                .language_servers
-                .file_event_handler
-                .file_changed(path);
+        if !cfg!(any(target_os = "linux", target_os = "android")) {
+            if let Some(path) = doc.path().map(ToOwned::to_owned) {
+                cx.editor
+                    .language_servers
+                    .file_event_handler
+                    .file_changed(path);
+            }
         }
 
         for view_id in view_ids {
@@ -3989,7 +3993,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         doc: "Add current workspace to the list of trusted workspaces.",
         fun: trust_workspace,
         completer: CommandCompleter::none(),
-        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
+        signature: Signature {
+            positionals: (0, None),
+            ..Signature::DEFAULT
+        },
     },
     TypableCommand {
         name: "workspace-untrust",
@@ -3997,8 +4004,11 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         doc: "Remove current workspace from the list of trusted workspaces.",
         fun: untrust_workspace,
         completer: CommandCompleter::none(),
-        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
-    }
+        signature: Signature {
+            positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
 ];
 
 pub static TYPABLE_COMMAND_MAP: Lazy<HashMap<&'static str, &'static TypableCommand>> =
