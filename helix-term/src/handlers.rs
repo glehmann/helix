@@ -6,6 +6,7 @@ use helix_event::AsyncHook;
 
 use crate::config::Config;
 use crate::events;
+use crate::handlers::auto_reload::PollHandler;
 use crate::handlers::auto_save::AutoSaveHandler;
 use crate::handlers::diagnostics::PullDiagnosticsHandler;
 use crate::handlers::signature_help::SignatureHelpHandler;
@@ -33,6 +34,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     let event_tx = completion::CompletionHandler::new(config.clone()).spawn();
     let signature_hints = SignatureHelpHandler::new().spawn();
     let auto_save = AutoSaveHandler::new().spawn();
+    let auto_reload = PollHandler::new().spawn();
     let document_colors = DocumentColorsHandler::default().spawn();
     let document_links = DocumentLinksHandler::default().spawn();
     let word_index = word_index::Handler::spawn();
@@ -43,6 +45,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
         completions: helix_view::handlers::completion::CompletionHandler::new(event_tx),
         signature_hints,
         auto_save,
+        auto_reload,
         document_colors,
         document_links,
         word_index,
@@ -61,6 +64,6 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     document_links::register_hooks(&handlers);
     prompt::register_hooks(&handlers);
     workspace_trust::register_hooks(&handlers);
-    auto_reload::register_hooks(&config.load().editor);
+    auto_reload::register_hooks(&handlers, &config.load().editor);
     handlers
 }
