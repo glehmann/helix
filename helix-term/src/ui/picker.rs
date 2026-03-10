@@ -37,6 +37,7 @@ use std::{
         atomic::{self, AtomicUsize},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use crate::ui::{Prompt, PromptEvent};
@@ -47,6 +48,7 @@ use helix_core::{
 use helix_view::{
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
+    input::{MouseButton, MouseEvent, MouseEventKind},
     theme::Style,
     view::ViewPosition,
     Document, DocumentId, Editor,
@@ -59,6 +61,9 @@ pub const ID: &str = "picker";
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
+
+/// Maximum delay between two clicks for them to count as a double click.
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(PartialEq, Eq, Hash)]
 pub enum PathOrId<'a> {
@@ -269,6 +274,16 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+    picker_area: Option<Rect>,
+    /// Area of the list body (picker area minus prompt and separator)
+    list_area: Option<Rect>,
+    /// Index of the first item rendered in `list_area`
+    list_offset: u32,
+    /// Position and time of the last left click, used for double click detection
+    last_click: Option<(Instant, u16, u16)>,
+    preview_area: Option<Rect>,
+    preview_offset: ViewPosition,
+    preview_cursor: Option<u32>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -394,6 +409,13 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            picker_area: None,
+            list_area: None,
+            list_offset: 0,
+            last_click: None,
+            preview_area: None,
+            preview_offset: ViewPosition::default(),
+            preview_cursor: None,
         }
     }
 
@@ -472,6 +494,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 self.cursor = self.cursor.saturating_add(len).saturating_sub(amount) % len;
             }
         }
+        self.preview_cursor = None;
     }
 
     /// Move the cursor down by exactly one page. After the last page comes the first page.
@@ -487,6 +510,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     /// Move the cursor to the first entry
     pub fn to_start(&mut self) {
         self.cursor = 0;
+        self.preview_cursor = None;
     }
 
     /// Move the cursor to the last entry
@@ -496,6 +520,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .snapshot()
             .matched_item_count()
             .saturating_sub(1);
+        self.preview_cursor = None;
     }
 
     pub fn selection(&self) -> Option<&T> {
@@ -531,6 +556,47 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         EventResult::Consumed(None)
     }
 
+    /// Runs the action bound to Enter on the current selection and then closes
+    /// the picker, mirroring a keypress of Enter.
+    fn confirm(&mut self, cx: &mut Context) -> EventResult {
+        if let Some(option) = self.selection() {
+            (self.callback_fn)(cx, option, self.default_action);
+        }
+        if let Some(history_register) = self.prompt.history_register() {
+            if let Err(err) = cx
+                .editor
+                .registers
+                .push(history_register, self.primary_query().to_string())
+            {
+                cx.editor.set_error(err.to_string());
+            }
+        }
+        self.close()
+    }
+
+    /// Closes the picker, stopping background streaming of new items.
+    fn close(&mut self) -> EventResult {
+        // if the picker is very large don't store it as last_picker to avoid
+        // excessive memory consumption
+        let callback: compositor::Callback = if self.matcher.snapshot().item_count() > 1_000_000 {
+            Box::new(|compositor: &mut Compositor, _ctx| {
+                // remove the layer
+                compositor.pop();
+            })
+        } else {
+            // stop streaming in new items in the background, really we should
+            // be restarting the stream somehow once the picker gets
+            // reopened instead (like for an FS crawl) that would also remove the
+            // need for the special case above but that is pretty tricky
+            self.version.fetch_add(1, atomic::Ordering::Relaxed);
+            Box::new(|compositor: &mut Compositor, _ctx| {
+                // remove the layer
+                compositor.last_picker = compositor.pop();
+            })
+        };
+        EventResult::Consumed(Some(callback))
+    }
+
     fn handle_prompt_change(&mut self, is_paste: bool) {
         // TODO: better track how the pattern has changed
         let line = self.prompt.line();
@@ -540,6 +606,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
         // If the query has meaningfully changed, reset the cursor to the top of the results.
         self.cursor = 0;
+        self.preview_cursor = None;
         // Have nucleo reparse each changed column.
         for (i, column) in self
             .columns
@@ -747,6 +814,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let rows = inner.height.saturating_sub(self.header_height()) as u32;
         let offset = self.cursor - (self.cursor % std::cmp::max(1, rows));
         let cursor = self.cursor.saturating_sub(offset);
+        self.list_area = Some(inner);
+        self.list_offset = offset;
         let end = offset
             .saturating_add(rows)
             .min(snapshot.matched_item_count());
@@ -896,6 +965,9 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let inner = inner.inner(margin);
         BLOCK.render(area, surface);
 
+        let cursor = self.cursor;
+        let mut offset = self.preview_offset;
+        let reset_offset = self.preview_cursor != Some(cursor);
         if let Some((preview, range)) = self.get_preview(cx.editor) {
             let doc = match preview.document() {
                 Some(doc)
@@ -930,30 +1002,32 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 }
             };
 
-            let mut offset = ViewPosition::default();
-            if let Some((start_line, end_line)) = range {
-                let height = end_line - start_line;
-                let text = doc.text().slice(..);
-                let start = text.line_to_char(start_line);
-                let middle = text.line_to_char(start_line + height / 2);
-                if height < inner.height as usize {
-                    let text_fmt = doc.text_format(inner.width, None);
-                    let annotations = TextAnnotations::default();
-                    (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
-                        text,
-                        middle,
-                        // align to middle
-                        -(inner.height as isize / 2),
-                        0,
-                        &text_fmt,
-                        &annotations,
-                    );
-                    if start < offset.anchor {
+            if reset_offset {
+                offset = ViewPosition::default();
+                if let Some((start_line, end_line)) = range {
+                    let height = end_line - start_line;
+                    let text = doc.text().slice(..);
+                    let start = text.line_to_char(start_line);
+                    let middle = text.line_to_char(start_line + height / 2);
+                    if height < inner.height as usize {
+                        let text_fmt = doc.text_format(inner.width, None);
+                        let annotations = TextAnnotations::default();
+                        (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
+                            text,
+                            middle,
+                            // align to middle
+                            -(inner.height as isize / 2),
+                            0,
+                            &text_fmt,
+                            &annotations,
+                        );
+                        if start < offset.anchor {
+                            offset.anchor = start;
+                            offset.vertical_offset = 0;
+                        }
+                    } else {
                         offset.anchor = start;
-                        offset.vertical_offset = 0;
                     }
-                } else {
-                    offset.anchor = start;
                 }
             }
 
@@ -979,10 +1053,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 }
             }
 
+            let conflicts = doc.conflicts();
             EditorView::doc_diagnostics_highlights_into(
                 doc,
                 &cx.editor.theme,
                 &mut overlay_highlights,
+                conflicts,
             );
 
             let mut decorations = DecorationManager::default();
@@ -1020,6 +1096,98 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 decorations,
             );
         }
+        self.preview_offset = offset;
+        self.preview_cursor = Some(cursor);
+    }
+
+    fn handle_mouse_event(&mut self, event: &MouseEvent, cx: &mut Context) -> EventResult {
+        let MouseEvent {
+            kind, column, row, ..
+        } = *event;
+        let contains = |area: Rect| {
+            column >= area.left()
+                && column < area.right()
+                && row >= area.top()
+                && row < area.bottom()
+        };
+        if let MouseEventKind::Down(MouseButton::Left) = kind {
+            if self.list_area.is_some_and(&contains) {
+                let list_area = self.list_area.expect("checked");
+                // Rows inside the list body below the (optional) header select the
+                // item under the pointer; a double click confirms the selection just
+                // like pressing Enter. Clicks on the header, prompt or empty space
+                // below the last row are ignored.
+                let clicked_row = row as i32 - list_area.top() as i32 - self.header_height() as i32;
+                if clicked_row >= 0 {
+                    let index = self.list_offset + clicked_row as u32;
+                    if index < self.matcher.snapshot().matched_item_count() {
+                        let now = Instant::now();
+                        let double_click =
+                            self.last_click
+                                .is_some_and(|(last, last_column, last_row)| {
+                                    now.duration_since(last) <= DOUBLE_CLICK_INTERVAL
+                                        && last_column == column
+                                        && last_row == row
+                                });
+                        if double_click {
+                            self.last_click = None;
+                            // Confirm the selection exactly like pressing Enter.
+                            return self.confirm(cx);
+                        }
+                        self.last_click = Some((now, column, row));
+                        self.cursor = index;
+                        self.preview_cursor = None;
+                    } else {
+                        self.last_click = None;
+                    }
+                } else {
+                    self.last_click = None;
+                }
+            } else {
+                self.last_click = None;
+            }
+            return EventResult::Consumed(None);
+        }
+        let direction = match kind {
+            MouseEventKind::ScrollUp => Direction::Backward,
+            MouseEventKind::ScrollDown => Direction::Forward,
+            _ => return EventResult::Consumed(None),
+        };
+
+        let offset = cx.editor.config().scroll_lines.unsigned_abs();
+        if self.picker_area.is_some_and(contains) {
+            self.move_by(offset as u32, direction);
+        } else if self.preview_area.is_some_and(contains) {
+            let mut preview_offset = self.preview_offset;
+            let preview_width = self
+                .preview_area
+                .expect("preview area was checked")
+                .width
+                .saturating_sub(4);
+            if let Some((preview, _)) = self.get_preview(cx.editor) {
+                if let Some(doc) = preview.document() {
+                    let text = doc.text().slice(..);
+                    let text_fmt = doc.text_format(preview_width, None);
+                    let annotations = TextAnnotations::default();
+                    let offset = match direction {
+                        Direction::Backward => -(offset as isize),
+                        Direction::Forward => offset as isize,
+                    };
+                    (preview_offset.anchor, preview_offset.vertical_offset) =
+                        char_idx_at_visual_offset(
+                            text,
+                            preview_offset.anchor,
+                            preview_offset.vertical_offset as isize + offset,
+                            0,
+                            &text_fmt,
+                            &annotations,
+                        );
+                }
+            }
+            self.preview_offset = preview_offset;
+        }
+
+        EventResult::Consumed(None)
     }
 }
 
@@ -1042,11 +1210,15 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         };
 
         let picker_area = area.with_width(picker_width);
+        self.picker_area = Some(picker_area);
         self.render_picker(picker_area, surface, cx);
 
         if render_preview {
             let preview_area = area.clip_left(picker_width);
+            self.preview_area = Some(preview_area);
             self.render_preview(preview_area, surface, cx);
+        } else {
+            self.preview_area = None;
         }
     }
 
@@ -1057,33 +1229,8 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             Event::Key(event) => *event,
             Event::Paste(..) => return self.prompt_handle_event(event, ctx),
             Event::Resize(..) => return EventResult::Consumed(None),
-            // Picker is a modal and should consume mouse events so clicks don't fall
-            // through to the editor underneath
-            Event::Mouse(_) => return EventResult::Consumed(None),
+            Event::Mouse(event) => return self.handle_mouse_event(event, ctx),
             _ => return EventResult::Ignored(None),
-        };
-
-        let close_fn = |picker: &mut Self| {
-            // if the picker is very large don't store it as last_picker to avoid
-            // excessive memory consumption
-            let callback: compositor::Callback =
-                if picker.matcher.snapshot().item_count() > 1_000_000 {
-                    Box::new(|compositor: &mut Compositor, _ctx| {
-                        // remove the layer
-                        compositor.pop();
-                    })
-                } else {
-                    // stop streaming in new items in the background, really we should
-                    // be restarting the stream somehow once the picker gets
-                    // reopened instead (like for an FS crawl) that would also remove the
-                    // need for the special case above but that is pretty tricky
-                    picker.version.fetch_add(1, atomic::Ordering::Relaxed);
-                    Box::new(|compositor: &mut Compositor, _ctx| {
-                        // remove the layer
-                        compositor.last_picker = compositor.pop();
-                    })
-                };
-            EventResult::Consumed(Some(callback))
         };
 
         match key_event {
@@ -1105,7 +1252,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             key!(End) => {
                 self.to_end();
             }
-            key!(Esc) | ctrl!('c') => return close_fn(self),
+            key!(Esc) | ctrl!('c') => return self.close(),
             alt!(Enter) => {
                 if let Some(option) = self.selection() {
                     (self.callback_fn)(ctx, option, self.default_action);
@@ -1131,32 +1278,20 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     // Inserting from the history register is a paste.
                     self.handle_prompt_change(true);
                 } else {
-                    if let Some(option) = self.selection() {
-                        (self.callback_fn)(ctx, option, self.default_action);
-                    }
-                    if let Some(history_register) = self.prompt.history_register() {
-                        if let Err(err) = ctx
-                            .editor
-                            .registers
-                            .push(history_register, self.primary_query().to_string())
-                        {
-                            ctx.editor.set_error(err.to_string());
-                        }
-                    }
-                    return close_fn(self);
+                    return self.confirm(ctx);
                 }
             }
             ctrl!('s') => {
                 if let Some(option) = self.selection() {
                     (self.callback_fn)(ctx, option, Action::HorizontalSplit);
                 }
-                return close_fn(self);
+                return self.close();
             }
             ctrl!('v') => {
                 if let Some(option) = self.selection() {
                     (self.callback_fn)(ctx, option, Action::VerticalSplit);
                 }
-                return close_fn(self);
+                return self.close();
             }
             ctrl!('t') => {
                 self.toggle_preview();

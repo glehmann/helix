@@ -955,21 +955,7 @@ impl Application {
                             format!("Language server exited: {}", language_server!().name());
                         self.editor.set_status(status);
 
-                        // LSPs may produce diagnostics for files that haven't been opened in helix,
-                        // we need to clear those and remove the entries from the list if this leads to
-                        // an empty diagnostic list for said files
-                        for diags in self.editor.diagnostics.values_mut() {
-                            diags.retain(|(_, provider)| {
-                                provider.language_server_id() != Some(server_id)
-                            });
-                        }
-
-                        self.editor.diagnostics.retain(|_, diags| !diags.is_empty());
-
-                        // Clear any diagnostics for documents with this server open.
-                        for doc in self.editor.documents_mut() {
-                            doc.clear_diagnostics_for_language_server(server_id);
-                        }
+                        self.editor.clear_diagnostics_for_language_server(server_id);
 
                         helix_event::dispatch(helix_view::events::LanguageServerExited {
                             editor: &mut self.editor,

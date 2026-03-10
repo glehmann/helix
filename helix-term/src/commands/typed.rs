@@ -1811,11 +1811,15 @@ fn lsp_restart(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
     }
 
     let editor_config = cx.editor.config.load();
-    let doc = doc!(cx.editor);
-    let config = doc
-        .language_config()
-        .context("LSP not defined for the current document")?;
-
+    let (config, doc_path) = {
+        let doc = doc!(cx.editor);
+        (
+            doc.language
+                .clone()
+                .context("LSP not defined for the current document")?,
+            doc.path().map(ToOwned::to_owned),
+        )
+    };
     let language_servers: Vec<_> = config
         .language_servers
         .iter()
@@ -1837,13 +1841,24 @@ fn lsp_restart(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> 
 
     let mut errors = Vec::new();
     for server in language_servers.iter() {
+        let server_ids: Vec<_> = cx
+            .editor
+            .language_servers
+            .iter_clients()
+            .filter(|client| client.name() == *server)
+            .map(|client| client.id())
+            .collect();
+        for id in server_ids {
+            cx.editor.clear_diagnostics_for_language_server(id);
+        }
+
         match cx
             .editor
             .language_servers
             .restart_server(
                 server,
-                config,
-                doc.path(),
+                &config,
+                doc_path.as_deref(),
                 &editor_config.workspace_lsp_roots,
                 editor_config.lsp.snippets,
             )
