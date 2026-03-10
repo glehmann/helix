@@ -821,7 +821,10 @@ impl Application {
                         };
                         let language_server = language_server!();
                         if !language_server.is_initialized() {
-                            log::error!("Discarding publishDiagnostic notification sent by an uninitialized server: {}", language_server.name());
+                            log::error!(
+                                "Discarding publishDiagnostic notification sent by an uninitialized server: {}",
+                                language_server.name()
+                            );
                             return;
                         }
                         let provider = helix_core::diagnostic::DiagnosticProvider::Lsp {
@@ -1055,12 +1058,27 @@ impl Application {
                                             match serde_json::from_value(options) {
                                                 Ok(ops) => ops,
                                                 Err(err) => {
-                                                    log::warn!("Failed to deserialize DidChangeWatchedFilesRegistrationOptions: {err}");
+                                                    log::warn!(
+                                                        "Failed to deserialize DidChangeWatchedFilesRegistrationOptions: {err}"
+                                                    );
                                                     continue;
                                                 }
                                             };
+                                        for watch in &ops.watchers {
+                                            if let lsp::GlobPattern::Relative(pattern) =
+                                                &watch.glob_pattern
+                                            {
+                                                let base_url = match &pattern.base_uri {
+                                                    lsp::OneOf::Left(folder) => &folder.uri,
+                                                    lsp::OneOf::Right(url) => url,
+                                                };
+                                                let Ok(base_dir) = base_url.to_file_path() else {
+                                                    continue;
+                                                };
+                                                self.editor.file_watcher.add_root(&base_dir);
+                                            }
+                                        }
                                         self.editor.language_servers.file_event_handler.register(
-                                            client.id(),
                                             Arc::downgrade(client),
                                             reg.id,
                                             ops,
@@ -1073,7 +1091,9 @@ impl Application {
                                         // case but that rejects the registration promise in the server which causes an
                                         // exit. So we work around this by ignoring the request and sending back an OK
                                         // response.
-                                        log::warn!("Ignoring a client/registerCapability request because dynamic capability registration is not enabled. Please report this upstream to the language server");
+                                        log::warn!(
+                                            "Ignoring a client/registerCapability request because dynamic capability registration is not enabled. Please report this upstream to the language server"
+                                        );
                                     }
                                 }
                             }
@@ -1091,7 +1111,10 @@ impl Application {
                                         .unregister(server_id, unreg.id);
                                 }
                                 _ => {
-                                    log::warn!("Received unregistration request for unsupported method: {}", unreg.method);
+                                    log::warn!(
+                                        "Received unregistration request for unsupported method: {}",
+                                        unreg.method
+                                    );
                                 }
                             }
                         }

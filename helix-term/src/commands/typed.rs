@@ -1508,14 +1508,16 @@ fn reload(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyh
 
     let scrolloff = cx.editor.config().scrolloff;
     let (view, doc) = current!(cx.editor);
-    doc.reload(view, &cx.editor.diff_providers).map(|_| {
+    doc.reload(view, &mut cx.editor.diff_providers).map(|_| {
         view.ensure_cursor_in_view(doc, scrolloff);
     })?;
     if let Some(path) = doc.path().map(ToOwned::to_owned) {
-        cx.editor
-            .language_servers
-            .file_event_handler
-            .file_changed(path);
+        if !cx.editor.file_watcher.is_watching(&path) {
+            cx.editor
+                .language_servers
+                .file_event_handler
+                .file_changed(path);
+        }
     }
     Ok(())
 }
@@ -1543,6 +1545,8 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         })
         .collect();
 
+    cx.editor.diff_providers.reset();
+
     for (doc_id, view_ids) in docs_view_ids {
         let doc = doc_mut!(cx.editor, &doc_id);
 
@@ -1552,16 +1556,18 @@ fn reload_all(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> 
         // Ensure that the view is synced with the document's history.
         view.sync_changes(doc);
 
-        if let Err(error) = doc.reload(view, &cx.editor.diff_providers) {
+        if let Err(error) = doc.reload(view, &mut cx.editor.diff_providers) {
             cx.editor.set_error(format!("{}", error));
             continue;
         }
 
         if let Some(path) = doc.path().map(ToOwned::to_owned) {
-            cx.editor
-                .language_servers
-                .file_event_handler
-                .file_changed(path);
+            if !cx.editor.file_watcher.is_watching(&path) {
+                cx.editor
+                    .language_servers
+                    .file_event_handler
+                    .file_changed(path);
+            }
         }
 
         for view_id in view_ids {
@@ -3989,7 +3995,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         doc: "Add current workspace to the list of trusted workspaces.",
         fun: trust_workspace,
         completer: CommandCompleter::none(),
-        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
+        signature: Signature {
+            positionals: (0, None),
+            ..Signature::DEFAULT
+        },
     },
     TypableCommand {
         name: "workspace-untrust",
@@ -3997,8 +4006,11 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         doc: "Remove current workspace from the list of trusted workspaces.",
         fun: untrust_workspace,
         completer: CommandCompleter::none(),
-        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
-    }
+        signature: Signature {
+            positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
 ];
 
 pub static TYPABLE_COMMAND_MAP: Lazy<HashMap<&'static str, &'static TypableCommand>> =

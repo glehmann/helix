@@ -191,7 +191,7 @@ pub struct Document {
 
     // Last time we wrote to the file. This will carry the time the file was last opened if there
     // were no saves.
-    last_saved_time: SystemTime,
+    pub last_saved_time: SystemTime,
 
     last_saved_revision: usize,
     version: i32, // should be usize?
@@ -200,7 +200,7 @@ pub struct Document {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
 
-    diff_handle: Option<DiffHandle>,
+    pub diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
 
     // when document was used for most-recent-used buffer picker
@@ -1290,7 +1290,7 @@ impl Document {
     pub fn reload(
         &mut self,
         view: &mut View,
-        provider_registry: &DiffProviderRegistry,
+        provider_registry: &mut DiffProviderRegistry,
     ) -> Result<(), Error> {
         let encoding = self.encoding;
         let path = match self.path() {
@@ -1300,6 +1300,8 @@ impl Document {
                 false => bail!("can't find file to reload from {:?}", self.display_name()),
             },
         };
+
+        provider_registry.reload(&path);
 
         // Once we have a valid path we check if its readonly status has changed
         self.detect_readonly();
