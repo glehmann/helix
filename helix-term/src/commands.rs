@@ -6318,7 +6318,6 @@ fn conflict_accept_at_cursor(cx: &mut Context) {
 }
 
 fn conflict_cycle_diffs(cx: &mut Context) {
-    use helix_core::conflict::NO_HIGHLIGHT_PAIR;
     let (view, doc) = current!(cx.editor);
     let text = doc.text();
     let cursor = doc.selection(view.id).primary().cursor(text.slice(..));
@@ -6330,20 +6329,23 @@ fn conflict_cycle_diffs(cx: &mut Context) {
     };
     let region = &conflicts[idx];
 
-    // 2-way conflicts have no base section — refine is a no-op.
-    if region.num_refine_pairs() == 0 {
-        return;
-    }
+    let num_pairs = region.num_refine_pairs();
+    let has_base_pairs = region.has_base_comparison();
 
     let mut cache = doc.conflict_cache.borrow_mut();
     let entry = cache.entry(region.start).or_default();
-    entry.pair = if entry.pair == NO_HIGHLIGHT_PAIR {
-        0
-    } else if entry.pair + 1 < region.num_refine_pairs() {
-        entry.pair + 1
+
+    if entry.show_base_pairs {
+        entry.show_base_pairs = false;
+        entry.pair = 0;
+    } else if entry.pair >= num_pairs {
+        entry.show_base_pairs = has_base_pairs;
+        entry.pair = 0;
+    } else if entry.pair + 1 == num_pairs {
+        entry.pair = num_pairs;
     } else {
-        NO_HIGHLIGHT_PAIR
-    };
+        entry.pair += 1;
+    }
     entry.diffs = None;
 }
 

@@ -1462,8 +1462,8 @@ impl Document {
 
         let old_doc = self.text().clone();
 
-        // Save refine pair for the cursor's conflict before the edit.
-        let saved_pair = self
+        // Save refine state for the cursor's conflict before the edit.
+        let saved_state = self
             .selections
             .get(&view_id)
             .and_then(|sel| {
@@ -1471,7 +1471,12 @@ impl Document {
                 let conflicts = find_conflicts(&old_doc);
                 conflict_at(&conflicts, cursor).map(|idx| conflicts[idx].start)
             })
-            .and_then(|key| self.conflict_cache.borrow().get(&key).map(|e| e.pair));
+            .and_then(|key| {
+                self.conflict_cache
+                    .borrow()
+                    .get(&key)
+                    .map(|e| (e.pair, e.show_base_pairs))
+            });
 
         let changes = transaction.changes();
         if !changes.apply(&mut self.text) {
@@ -1509,7 +1514,7 @@ impl Document {
         {
             let mut cache = self.conflict_cache.borrow_mut();
             cache.clear();
-            if let Some(pair) = saved_pair {
+            if let Some((pair, show_base_pairs)) = saved_state {
                 let cursor = self
                     .selection(view_id)
                     .primary()
@@ -1519,6 +1524,7 @@ impl Document {
                         .entry(self.conflict_regions[idx].start)
                         .or_insert_with(|| ConflictRefineEntry {
                             pair,
+                            show_base_pairs,
                             diffs: None,
                             side_added: None,
                         });
