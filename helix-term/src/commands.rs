@@ -6378,21 +6378,46 @@ fn resolve_conflict_impl(cx: &mut Context, resolution: ConflictResolution) {
 
                 let replacement: Option<String> = match resolution {
                     ConflictResolution::Current => {
-                        let (s, e) = helix_core::conflict::current_content(region);
-                        Some(text.slice(s..e).to_string())
+                        let first = &region.sections[0];
+                        if first.kind == helix_core::conflict::SectionKind::Diff {
+                            Some(helix_core::conflict::resolve_diff_content(text, first))
+                        } else {
+                            let (s, e) = helix_core::conflict::current_content(region);
+                            Some(text.slice(s..e).to_string())
+                        }
                     }
                     ConflictResolution::Incoming => {
-                        let (s, e) = helix_core::conflict::incoming_content(region);
-                        Some(text.slice(s..e).to_string())
+                        let last = region.sections.last().unwrap();
+                        if last.kind == helix_core::conflict::SectionKind::Diff {
+                            Some(helix_core::conflict::resolve_diff_content(text, last))
+                        } else {
+                            let (s, e) = helix_core::conflict::incoming_content(region);
+                            Some(text.slice(s..e).to_string())
+                        }
                     }
-                    ConflictResolution::Base => helix_core::conflict::base_content(region)
-                        .map(|(s, e)| text.slice(s..e).to_string()),
+                    ConflictResolution::Base => {
+                        if let Some((s, e)) = helix_core::conflict::base_content(region) {
+                            Some(text.slice(s..e).to_string())
+                        } else {
+                            region
+                                .sections
+                                .iter()
+                                .find(|s| s.kind == helix_core::conflict::SectionKind::Diff)
+                                .map(|section| {
+                                    helix_core::conflict::resolve_diff_content_base(text, section)
+                                })
+                        }
+                    }
                     ConflictResolution::All => {
                         Some(helix_core::conflict::all_sides_content(text, region))
                     }
                     ConflictResolution::Section(idx) => region.sections.get(idx).map(|section| {
-                        let (s, e) = (section.content_start, section.content_end);
-                        text.slice(s..e).to_string()
+                        if section.kind == helix_core::conflict::SectionKind::Diff {
+                            helix_core::conflict::resolve_diff_content(text, section)
+                        } else {
+                            text.slice(section.content_start..section.content_end)
+                                .to_string()
+                        }
                     }),
                 };
 

@@ -15,7 +15,8 @@ use crate::{
 
 use helix_core::{
     conflict::{
-        conflict_marker_lines, conflict_pair_sections, refine_diff, ConflictRegion, SectionKind,
+        conflict_marker_lines, conflict_pair_sections, refine_diff, refine_diff_section,
+        refine_side_with_base, resolve_diff_content_base, ConflictRegion, SectionKind,
         NO_HIGHLIGHT_PAIR,
     },
     diagnostic::NumberOrString,
@@ -725,28 +726,70 @@ impl EditorView {
                 continue;
             }
 
+            // Regular refine (pair-based, interactive via ]r/[r).
             let entry = cache.entry(region.start).or_default();
             if entry.pair == NO_HIGHLIGHT_PAIR {
                 continue;
             }
             let pair = entry.pair.min(region.num_refine_pairs().saturating_sub(1));
-            let Some((left, right)) = conflict_pair_sections(region, pair) else {
-                continue;
-            };
+            if let Some((left, right)) = conflict_pair_sections(region, pair) {
+                // For side↔side pairs (no Base involved) both sides are
+                // "added" — neither is conceptually "removed" in a conflict.
+                let is_side_side = region.refine_pair_indices(pair).is_some_and(|(i, j)| {
+                    region.sections[i].kind == SectionKind::Side
+                        && region.sections[j].kind == SectionKind::Side
+                });
+                let left_hl = if is_side_side { added_hl } else { removed_hl };
 
-            // For side↔side pairs (no Base involved) both sides are
-            // "added" — neither is conceptually "removed" in a conflict.
-            let is_side_side = region.refine_pair_indices(pair).is_some_and(|(i, j)| {
-                region.sections[i].kind == SectionKind::Side
-                    && region.sections[j].kind == SectionKind::Side
+                let (removed, added) = entry
+                    .diffs
+                    .get_or_insert_with(|| refine_diff(text, left, right));
+                spans.extend(removed.iter().map(|r| (left_hl, r.clone())));
+                spans.extend(added.iter().map(|r| (added_hl, r.clone())));
+            }
+
+            // Always-on: word-diff within each Diff section.
+            for section in &region.sections {
+                if section.kind == SectionKind::Diff {
+                    let (removed, added) = refine_diff_section(text, section);
+                    spans.extend(removed.iter().map(|r| (removed_hl, r.clone())));
+                    spans.extend(added.iter().map(|r| (added_hl, r.clone())));
+                }
+            }
+
+            // Always-on: word-diff each Side section against resolved base from Diff.
+            let side_added = entry.side_added.get_or_insert_with(|| {
+                region
+                    .sections
+                    .iter()
+                    .map(|s| {
+                        if s.kind == SectionKind::Side {
+                            region
+                                .sections
+                                .iter()
+                                .find(|d| d.kind == SectionKind::Diff)
+                                .and_then(|diff| {
+                                    let base = resolve_diff_content_base(text, diff);
+                                    if !base.is_empty() {
+                                        Some(refine_side_with_base(text, s, &base))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .collect::<Vec<_>>()
             });
-            let left_hl = if is_side_side { added_hl } else { removed_hl };
-
-            let (removed, added) = entry
-                .diffs
-                .get_or_insert_with(|| refine_diff(text, left, right));
-            spans.extend(removed.iter().map(|r| (left_hl, r.clone())));
-            spans.extend(added.iter().map(|r| (added_hl, r.clone())));
+            for (section_idx, section) in region.sections.iter().enumerate() {
+                if section.kind == SectionKind::Side {
+                    if let Some(added) = side_added.get(section_idx) {
+                        spans.extend(added.iter().map(|r| (added_hl, r.clone())));
+                    }
+                }
+            }
         }
 
         if spans.is_empty() {
@@ -778,6 +821,10 @@ impl EditorView {
             theme.try_get("diff.conflict.current"),
             theme.try_get("diff.conflict.base"),
             theme.try_get("diff.conflict.incoming"),
+            theme.try_get("diff.conflict.removed"),
+            theme.try_get("diff.conflict.added"),
+            theme.try_get("diff.conflict.diff_removed"),
+            theme.try_get("diff.conflict.diff_added"),
         ];
         if styles.iter().all(|s| s.is_none()) {
             return None;
@@ -787,25 +834,61 @@ impl EditorView {
         let ranges: Vec<(usize, usize, usize)> = conflicts
             .iter()
             .flat_map(|region| {
-                region.sections.iter().enumerate().map(|(i, s)| {
-                    let l0 = text.char_to_line(s.content_start);
-                    let l1 = text.char_to_line(s.content_end);
-                    let slot = match s.kind {
-                        helix_core::conflict::SectionKind::Base => 1,
+                let mut entries = Vec::new();
+                for (i, s) in region.sections.iter().enumerate() {
+                    match s.kind {
+                        helix_core::conflict::SectionKind::Diff => {
+                            let base_line = text.char_to_line(s.content_start);
+                            let mut run_start: Option<usize> = None;
+                            let mut run_slot = 2;
+                            for (li, line) in text
+                                .slice(s.content_start..s.content_end)
+                                .lines()
+                                .enumerate()
+                            {
+                                let first = line.chars().next().unwrap_or(' ');
+                                let slot = match first {
+                                    '-' => 5,
+                                    '+' => 6,
+                                    _ => 2,
+                                };
+                                let doc_line = base_line + li;
+                                match run_start {
+                                    Some(_) if slot == run_slot => {}
+                                    Some(start) => {
+                                        entries.push((start, doc_line, run_slot));
+                                        run_start = Some(doc_line);
+                                        run_slot = slot;
+                                    }
+                                    None => {
+                                        run_start = Some(doc_line);
+                                        run_slot = slot;
+                                    }
+                                }
+                            }
+                            if let Some(start) = run_start {
+                                let end_line = text.char_to_line(s.content_end);
+                                entries.push((start, end_line, run_slot));
+                            }
+                        }
                         helix_core::conflict::SectionKind::Side => {
+                            let l0 = text.char_to_line(s.content_start);
+                            let l1 = text.char_to_line(s.content_end);
                             let side_idx = region.sections[..i]
                                 .iter()
                                 .filter(|s| s.kind == helix_core::conflict::SectionKind::Side)
                                 .count();
-                            if side_idx % 2 == 0 {
-                                0
-                            } else {
-                                2
-                            }
+                            let slot = if side_idx % 2 == 0 { 0 } else { 2 };
+                            entries.push((l0, l1, slot));
                         }
-                    };
-                    (l0, l1, slot)
-                })
+                        helix_core::conflict::SectionKind::Base => {
+                            let l0 = text.char_to_line(s.content_start);
+                            let l1 = text.char_to_line(s.content_end);
+                            entries.push((l0, l1, 1));
+                        }
+                    }
+                }
+                entries
             })
             .collect();
         let inner = view.inner_area(doc);
