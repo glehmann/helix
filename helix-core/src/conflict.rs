@@ -43,23 +43,20 @@ use imara_diff::{Algorithm, Diff, InternedInput};
 
 use crate::Rope;
 
-/// Sentinel value for [`ConflictRefineEntry::pair`] — skip word-diff rendering.
-pub const NO_HIGHLIGHT_PAIR: usize = usize::MAX;
-
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Pair of removed/added word-diff ranges for a conflict refine pair.
 type RefineDiffs = (Vec<Range<usize>>, Vec<Range<usize>>);
 
 /// Per-conflict word-level diff cache entry, keyed by conflict start position.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ConflictRefineEntry {
     /// Current refine pair index (see [`ConflictRegion::refine_pair_indices`]).
-    /// For a 3-section diff3 conflict: 0 = current↔base, 1 = base↔incoming, 2 = current↔incoming.
-    /// For N-way jj conflicts the ordering prioritises each side vs base,
-    /// then side–side comparisons; remaining base-involving pairs are excluded.
-    /// Set to [`NO_HIGHLIGHT_PAIR`] to disable word-diff rendering.
+    /// Set to `num_refine_pairs()` to show no word-level highlights.
     pub pair: usize,
+    /// When `true`, show all adjacent (Side, Base) pair word-diffs
+    /// simultaneously as the default state (before any single-pair cycle).
+    pub show_base_pairs: bool,
     /// Cached word-diff results for the current `pair`:
     /// `(removed_ranges, added_ranges)`.
     pub diffs: Option<RefineDiffs>,
@@ -68,10 +65,21 @@ pub struct ConflictRefineEntry {
     pub side_added: Option<Vec<Vec<Range<usize>>>>,
 }
 
+impl Default for ConflictRefineEntry {
+    fn default() -> Self {
+        Self {
+            pair: 0,
+            show_base_pairs: true,
+            diffs: None,
+            side_added: None,
+        }
+    }
+}
+
 /// Per-conflict word-diff refine state, keyed by [`ConflictRegion::start`].
 ///
-/// Cleared on every edit; the active pair setting is preserved when the cursor
-/// was inside a conflict before the edit.
+/// Cleared on every edit; the active pair setting (`entry.pair`) is preserved
+/// when the cursor was inside a conflict before the edit.
 pub type ConflictCache = HashMap<usize, ConflictRefineEntry>;
 
 /// Whether a section holds one side of a conflict, a common base, or a
@@ -127,85 +135,114 @@ pub struct ConflictRegion {
 }
 
 impl ConflictRegion {
-    /// Number of word-diff pairs available via refine.
+    /// Total number of single‑pair states available via refine.
     ///
-    /// Only phase-1 (each side vs adjacent base) and phase-2 (side–side) pairs
-    /// are counted; remaining pairs involving bases are never shown.
+    /// These are the states reachable *after* the initial `show_base_pairs`
+    /// step.  The count is:
+    ///
+    ///   base_side (0 or 1)  +  Side‑Side upper‑triangular over non‑Base
+    ///
+    /// where `base_side` covers the last‑Base‑vs‑last‑Side pair (Phase 1 of
+    /// [`refine_pair_indices`]) and the upper‑triangular covers all remaining
+    /// Non‑Base × Non‑Base combinations (Phase 2).
     pub fn num_refine_pairs(&self) -> usize {
-        let n = self.sections.len();
-        let mut count = 0;
-
-        // Phase 1
-        for i in 1..n {
-            if (i == 1 || self.sections[i - 1].kind == SectionKind::Base)
-                && self.sections[i].kind != SectionKind::Diff
-            {
-                count += 1;
-            }
-        }
-        // Phase 2
-        for skip in 1..n {
-            for i in 0..(n - skip) {
-                let (a, b) = (i, i + skip);
-                if self.sections[a].kind == SectionKind::Side
-                    && self.sections[b].kind == SectionKind::Side
-                    && !((a == 0 || self.sections[a].kind == SectionKind::Base) && b == a + 1)
-                {
-                    count += 1;
-                }
-            }
-        }
-        count
+        let non_base_count = self
+            .sections
+            .iter()
+            .filter(|s| s.kind != SectionKind::Base)
+            .count();
+        let side_side = if non_base_count < 2 {
+            0
+        } else {
+            non_base_count * (non_base_count - 1) / 2
+        };
+        let has_base = self.sections.iter().any(|s| s.kind == SectionKind::Base);
+        let last_is_side = self
+            .sections
+            .last()
+            .is_some_and(|s| s.kind == SectionKind::Side);
+        let base_side = if has_base && last_is_side { 1 } else { 0 };
+        base_side + side_side
     }
 
-    /// Return the pair of section indices for refine `pair` index.
+    /// Return the pair of section indices for the given refine `pair` index.
     ///
-    /// Pairs are ordered so comparisons relevant to N-way conflicts come first:
-    ///   1. Each Side compared against its adjacent Base — `(0,1)` first, then
-    ///      all `(i,i+1)` where section `i` is a **Base**.
-    ///   2. All Side–Side pairs (both sections are `Side`), with the left side
-    ///      fixed as long as possible before advancing.
+    /// Returns `None` when `pair >= num_refine_pairs()`.
     ///
-    /// For a standard git diff3 3-section conflict (Side,Base,Side) this still
-    /// produces (0,1)=current↔base, (1,2)=base↔incoming, (0,2)=current↔incoming.
-    /// Returns `None` if `pair >= num_refine_pairs()`.
+    /// Ordering (two phases):
+    ///
+    /// 1. **Base–Side** — pair `0` (when a Base exists and the last section
+    ///    is a Side): the last Base section vs the last Side section.
+    /// 2. **Non‑Base × Non‑Base** — pairs `1..N` in upper‑triangular order
+    ///    over all sections that are *not* Base (Side and Diff).
     pub fn refine_pair_indices(&self, pair: usize) -> Option<(usize, usize)> {
-        let n = self.sections.len();
-        if pair >= self.num_refine_pairs() {
+        let non_base: Vec<usize> = (0..self.sections.len())
+            .filter(|i| self.sections[*i].kind != SectionKind::Base)
+            .collect();
+        let m = non_base.len();
+        let side_side = m * m.saturating_sub(1) / 2;
+        let has_base = self.sections.iter().any(|s| s.kind == SectionKind::Base);
+        let last_is_side = self
+            .sections
+            .last()
+            .is_some_and(|s| s.kind == SectionKind::Side);
+        let base_side = if has_base && last_is_side { 1 } else { 0 };
+        let total = base_side + side_side;
+        if pair >= total {
             return None;
         }
+        // Phase 1: last Base vs last Side (when available, at index 0)
+        if base_side > 0 && pair == 0 {
+            let last_side_idx = self.sections.len() - 1;
+            let last_base_idx = self.sections[..last_side_idx]
+                .iter()
+                .rposition(|s| s.kind == SectionKind::Base)?;
+            return Some((last_base_idx, last_side_idx));
+        }
+        // Remaining pairs are shifted by `base_side`.
+        // Phase 2: upper‑triangular over non‑Base sections
+        let offset = base_side;
+        let ss_pair = pair - offset;
         let mut idx = 0;
-
-        // Phase 1: (0,1) first, then all (i,i+1) where sections[i] is Base.
-        for i in 1..n {
-            let in_phase1 = (i == 1 || self.sections[i - 1].kind == SectionKind::Base)
-                && self.sections[i].kind != SectionKind::Diff;
-            if in_phase1 {
-                if idx == pair {
-                    return Some((i - 1, i));
+        for ai in 0..m {
+            for bi in (ai + 1)..m {
+                if idx == ss_pair {
+                    return Some((non_base[ai], non_base[bi]));
                 }
                 idx += 1;
             }
         }
-
-        // Phase 2: Side–Side pairs, left side fixed as long as possible.
-        let side_indices: Vec<usize> = (0..n)
-            .filter(|i| self.sections[*i].kind == SectionKind::Side)
-            .collect();
-        for a_idx in 0..side_indices.len() {
-            for b_idx in (a_idx + 1)..side_indices.len() {
-                let (a, b) = (side_indices[a_idx], side_indices[b_idx]);
-                let already = (a == 0 || self.sections[a].kind == SectionKind::Base) && b == a + 1;
-                if !already {
-                    if idx == pair {
-                        return Some((a, b));
-                    }
-                    idx += 1;
-                }
-            }
-        }
-
         None
+    }
+
+    /// Whether this conflict has at least one adjacent (Side, Base) pair
+    /// — two consecutive sections where the first is Side and the second is
+    /// Base.  These are the pairs shown in the initial `show_base_pairs`
+    /// state.
+    pub fn has_adjacent_side_base_pairs(&self) -> bool {
+        self.sections
+            .windows(2)
+            .any(|w| w[0].kind == SectionKind::Side && w[1].kind == SectionKind::Base)
+    }
+
+    /// Whether this conflict has a "base comparison" — a default view shown
+    /// before any single‑pair cycle.  True when the conflict has adjacent
+    /// (Side, Base) pairs (git diff3 / jj snapshot) or Diff sections (jj
+    /// diff format, where the always‑on highlights form the base comparison).
+    pub fn has_base_comparison(&self) -> bool {
+        self.has_adjacent_side_base_pairs()
+            || self.sections.iter().any(|s| s.kind == SectionKind::Diff)
+    }
+
+    /// Return the section-index pairs for all adjacent (Side, Base) pairs in
+    /// document order.
+    pub fn adjacent_side_base_pairs(&self) -> Vec<(usize, usize)> {
+        self.sections
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0].kind == SectionKind::Side && w[1].kind == SectionKind::Base)
+            .map(|(i, _)| (i, i + 1))
+            .collect()
     }
 }
 
@@ -601,18 +638,17 @@ pub fn resolve_diff_content_base(text: &Rope, section: &Section) -> String {
 
 /// Returns the content ranges `(left, right)` for refine pair `pair`.
 ///
-/// Pairs are enumerated in (i, j) order with i < j over all section indices.
+/// Pairs are enumerated in upper-triangular order over all non-Base sections.
+/// For (Diff, Side) pairs the order is swapped so Side is on the left.
 /// Returns `None` if `pair >= region.num_refine_pairs()`.
 pub fn conflict_pair_sections(
     region: &ConflictRegion,
     pair: usize,
 ) -> Option<((usize, usize), (usize, usize))> {
     let (i, j) = region.refine_pair_indices(pair)?;
-    // When one section is Base, put it on the left (before) so that
-    // removed=red highlights what the base had, added=green highlights
-    // what the Side added on top.  Side↔Side pairs keep their order.
+    // When one section is Diff and the other is Side, put Side on the left.
     let (i, j) = match (region.sections[i].kind, region.sections[j].kind) {
-        (SectionKind::Side, SectionKind::Base) => (j, i),
+        (SectionKind::Diff, SectionKind::Side) => (j, i),
         _ => (i, j),
     };
     let left = (
@@ -1050,6 +1086,101 @@ pub fn refine_side_with_base(
         .collect()
 }
 
+// ── Side–Diff word-diff ────────────────────────────────────────────────────────
+
+/// Like `resolve_diff_content` but also returns a position map: for each char
+/// index in the resolved string, the corresponding char index in the rope.
+fn resolve_diff_content_mapped(text: &Rope, section: &Section) -> (String, Vec<usize>) {
+    let mut content = String::new();
+    let mut map = Vec::new();
+    let mut rope_char_pos = section.content_start;
+    for line in text
+        .slice(section.content_start..section.content_end)
+        .lines()
+    {
+        let line_str = line.to_string();
+        let first = line_str.chars().next();
+        match first {
+            Some('-') => {
+                rope_char_pos += line_str.chars().count();
+            }
+            Some('+') | Some(' ') => {
+                rope_char_pos += 1; // skip the prefix char
+                for c in line_str[1..].chars() {
+                    content.push(c);
+                    map.push(rope_char_pos);
+                    rope_char_pos += 1;
+                }
+            }
+            _ => {
+                for c in line_str.chars() {
+                    content.push(c);
+                    map.push(rope_char_pos);
+                    rope_char_pos += 1;
+                }
+            }
+        }
+    }
+    (content, map)
+}
+
+/// Word-diff Side (plain text) against Their (resolved from Diff).
+///
+/// Returns `(side_ranges, diff_ranges)` — char-index ranges in the rope for
+/// words that appear in Side but not in Their (shown on the Side section) and
+/// words that appear in Their but not in Side (shown on the Diff section).
+/// Both use the "added" (green) style.  The always-on intra-Diff word-diff
+/// provides the `-`/`+` line-level highlighting within Diff sections.
+pub fn refine_side_diff_added(
+    text: &Rope,
+    side_section: &Section,
+    diff_section: &Section,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let side_str = text
+        .slice(side_section.content_start..side_section.content_end)
+        .to_string();
+    let (their_str, their_map) = resolve_diff_content_mapped(text, diff_section);
+
+    let left_tokens = StringWordTokens::new(&side_str);
+    let right_tokens = StringWordTokens::new(&their_str);
+    let left_positions = left_tokens.positions.clone();
+    let right_positions = right_tokens.positions.clone();
+    let input = InternedInput::new(left_tokens, right_tokens);
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+
+    let mut side_ranges: Vec<Range<usize>> = Vec::new();
+    let mut diff_ranges: Vec<Range<usize>> = Vec::new();
+
+    for hunk in diff.hunks() {
+        // Words in Side (left) not in Their → show on Side section (green)
+        for &(s, e) in &left_positions[hunk.before.start as usize..hunk.before.end as usize] {
+            let rope_start = side_section.content_start + side_str[..s].chars().count();
+            let rope_end = side_section.content_start + side_str[..e].chars().count();
+            match side_ranges.last_mut() {
+                Some(r) if r.end == rope_start => r.end = rope_end,
+                _ => side_ranges.push(rope_start..rope_end),
+            }
+        }
+        // Words in Their (right) not in Side → show on Diff section (green)
+        for &(s, e) in &right_positions[hunk.after.start as usize..hunk.after.end as usize] {
+            let char_s = their_str[..s].chars().count();
+            let char_e = their_str[..e].chars().count();
+            let rope_start = their_map[char_s];
+            let rope_end = if char_e < their_map.len() {
+                their_map[char_e]
+            } else {
+                rope_start + their_str[s..e].chars().count()
+            };
+            match diff_ranges.last_mut() {
+                Some(r) if r.end == rope_start => r.end = rope_end,
+                _ => diff_ranges.push(rope_start..rope_end),
+            }
+        }
+    }
+
+    (side_ranges, diff_ranges)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1229,8 +1360,10 @@ mod tests {
     }
 
     #[test]
-    fn jj_snapshot_three_sides() {
-        // jj snapshot format: 3 sides + 1 base (4 sections)
+    fn refine_pairs_jj_snapshot_three_sides() {
+        // 5 sections [S0,B1,S2,B3,S4]
+        // Phase 1: base-last-side (3,4)
+        // Phase 2: side-side     (0,2), (0,4), (2,4) — C(3,2)
         let text = concat!(
             "<<<<<<< Conflict 1 of 1\n",
             "+++++++ side #1\n",
@@ -1255,7 +1388,7 @@ mod tests {
         assert_eq!(c.sections[2].kind, SectionKind::Side);
         assert_eq!(c.sections[3].kind, SectionKind::Base);
         assert_eq!(c.sections[4].kind, SectionKind::Side);
-        assert_eq!(c.num_refine_pairs(), 6);
+        assert_eq!(c.num_refine_pairs(), 4);
     }
 
     #[test]
@@ -1455,8 +1588,8 @@ mod tests {
             ),
             (
                 "<<<<<<< HEAD\ncurrent\n||||||| base\nbase\n=======\nincoming\n>>>>>>> b\n",
-                3,
-                &[(0, 1), (1, 2), (0, 2)],
+                2,
+                &[(1, 2), (0, 2)], // Phase 1: base-side; Phase 2: side-side
             ),
         ];
         for &(text, num_pairs, pairs) in cases {
@@ -1470,33 +1603,23 @@ mod tests {
     }
 
     #[test]
-    fn refine_pairs_side_diff() {
-        // (Side, Diff) — no refine pairs, Diff is self-contained
-        let text = concat!(
-            "<<<<<<< conflict 1 of 1\n",
-            "+++++++ side\n",
-            "content\n",
-            "%%%%%%% diff from: base\n",
-            "\\\\\\\\\\\\\\        to: side\n",
-            " base\n",
-            "-old\n",
-            "+new\n",
-            ">>>>>>> conflict 1 of 1 ends\n",
-        );
+    fn refine_pairs_three_way() {
+        // 3 sections [S0,B1,S2]
+        // Phase 1: base-last-side (1,2)
+        // Phase 2: side-side      (0,2)
+        let text = "<<<<<<< HEAD\ncurrent\n||||||| base\nbase\n=======\nincoming\n>>>>>>> b\n";
         let c = &find_conflicts(&rope(text))[0];
-        assert_eq!(c.sections.len(), 2);
-        assert_eq!(c.sections[0].kind, SectionKind::Side);
-        assert_eq!(c.sections[1].kind, SectionKind::Diff);
-        assert_eq!(c.num_refine_pairs(), 0);
-        assert_eq!(c.refine_pair_indices(0), None);
+        assert_eq!(c.num_refine_pairs(), 2);
+        assert_eq!(c.refine_pair_indices(0), Some((1, 2)));
+        assert_eq!(c.refine_pair_indices(1), Some((0, 2)));
+        assert_eq!(c.refine_pair_indices(2), None);
     }
 
     #[test]
     fn refine_pairs_four_sections() {
-        // 4 sections [S0,B1,S2,S3], pairs only from phases 1+2:
-        //   phase 1: (0,1),(1,2) = 2
-        //   phase 2 (Side–Side, fixed left): (0,2),(0,3),(2,3) = 3
-        //   total: 5  (pair (1,3)=B1,S3 is excluded)
+        // 4 sections [S0,B1,S2,S3]
+        // Phase 1: base-last-side  (1,3)
+        // Phase 2: side-side      (0,2), (0,3), (2,3)
         let text = concat!(
             "<<<<<<< Conflict\n",
             "+++++++ s1\nA\n",
@@ -1507,44 +1630,36 @@ mod tests {
         );
         let c = &find_conflicts(&rope(text))[0];
         assert_eq!(c.sections.len(), 4);
-        assert_eq!(c.num_refine_pairs(), 5);
-        assert_eq!(c.refine_pair_indices(0), Some((0, 1)));
-        assert_eq!(c.refine_pair_indices(1), Some((1, 2)));
-        assert_eq!(c.refine_pair_indices(2), Some((0, 2)));
-        assert_eq!(c.refine_pair_indices(3), Some((0, 3)));
-        assert_eq!(c.refine_pair_indices(4), Some((2, 3)));
-        assert_eq!(c.refine_pair_indices(5), None);
+        assert_eq!(c.num_refine_pairs(), 4);
+        assert_eq!(c.refine_pair_indices(0), Some((1, 3)));
+        assert_eq!(c.refine_pair_indices(1), Some((0, 2)));
+        assert_eq!(c.refine_pair_indices(2), Some((0, 3)));
+        assert_eq!(c.refine_pair_indices(3), Some((2, 3)));
+        assert_eq!(c.refine_pair_indices(4), None);
     }
 
     #[test]
-    fn pair_sections_put_base_on_left() {
+    fn pair_sections_no_base_swap() {
         // diff3: sections = [Side(current), Base, Side(incoming)]
-        // Skip-distance ordering: (0,1), (1,2), (0,2)
-        // Pair 0 = (Side, Base) → MUST swap → left=base, right=current
-        // Pair 1 = (Base, Side) → already base-left, NO swap
-        // Pair 2 = (Side, Side) → order preserved
+        // Pair 0: (1,2) = (Base, Side) → no swap (not Diff+Side)
+        // Pair 1: (0,2) = (Side, Side) → no swap, kept in order
         let text = "<<<<<<< HEAD\ncurrent\n||||||| base\nbase\n=======\nincoming\n>>>>>>> b\n";
         let r = rope(text);
         let c = &find_conflicts(&r)[0];
+        assert_eq!(c.num_refine_pairs(), 2);
 
-        // pair 0 => indices (0,1) = (Side, Base) -> MUST swap to (Base, Side)
+        // pair 0 => (1,2) = (Base, Side) → no swap
         let (left, right) = conflict_pair_sections(c, 0).unwrap();
-        assert_eq!(r.slice(left.0..left.1).to_string(), "base\n"); // base on left (red)
-        assert_eq!(r.slice(right.0..right.1).to_string(), "current\n"); // side on right (green)
+        assert_eq!(r.slice(left.0..left.1).to_string(), "base\n");
+        assert_eq!(r.slice(right.0..right.1).to_string(), "incoming\n");
 
-        // pair 1 => indices (1,2) = (Base, Side) -> already base-left, NO swap
+        // pair 1 => (0,2) = (Side, Side) → no swap, kept in order
         let (left, right) = conflict_pair_sections(c, 1).unwrap();
-        assert_eq!(r.slice(left.0..left.1).to_string(), "base\n"); // base on left
-        assert_eq!(r.slice(right.0..right.1).to_string(), "incoming\n"); // side on right
-
-        // pair 2 => indices (0,2) = (Side, Side) -> order preserved
-        let (left, right) = conflict_pair_sections(c, 2).unwrap();
         assert_eq!(r.slice(left.0..left.1).to_string(), "current\n");
         assert_eq!(r.slice(right.0..right.1).to_string(), "incoming\n");
 
-        assert!(conflict_pair_sections(c, 3).is_none());
+        assert!(conflict_pair_sections(c, 2).is_none());
     }
-
     #[test]
     fn refine_pair_clamped_and_default() {
         let text = "<<<<<<< HEAD\ncurrent\n=======\nincoming\n>>>>>>> b\n"; // 1 pair, max idx 0
@@ -1564,11 +1679,12 @@ mod tests {
         state.insert(c.start, 0);
         assert_eq!(conflict_refine_pair(&state, c), 0);
     }
+
     #[test]
     fn conflict_marker_lines_returns_sorted() {
         let text = concat!(
             "before\n",
-            "<<<<<<< HEAD\nours\n||||||| base\nbase\n=======\ntheirs\n>>>>>>> b\n",
+            "<<<<<<< HEAD\ncurrent\n||||||| base\nbase\n=======\nincoming\n>>>>>>> b\n",
             "after\n",
         );
         let r = rope(text);

@@ -16,8 +16,8 @@ use crate::{
 use helix_core::{
     conflict::{
         conflict_marker_lines, conflict_pair_sections, refine_diff, refine_diff_section,
-        refine_side_with_base, resolve_diff_content_base, ConflictRegion, SectionKind,
-        NO_HIGHLIGHT_PAIR,
+        refine_side_diff_added, refine_side_with_base, resolve_diff_content_base, ConflictRegion,
+        SectionKind,
     },
     diagnostic::NumberOrString,
     graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
@@ -728,65 +728,131 @@ impl EditorView {
 
             // Regular refine (pair-based, interactive via ]r/[r).
             let entry = cache.entry(region.start).or_default();
-            if entry.pair == NO_HIGHLIGHT_PAIR {
-                continue;
+            let num_pairs = region.num_refine_pairs();
+            if entry.pair > num_pairs {
+                entry.pair = num_pairs;
             }
-            let pair = entry.pair.min(region.num_refine_pairs().saturating_sub(1));
-            if let Some((left, right)) = conflict_pair_sections(region, pair) {
-                // For side↔side pairs (no Base involved) both sides are
-                // "added" — neither is conceptually "removed" in a conflict.
-                let is_side_side = region.refine_pair_indices(pair).is_some_and(|(i, j)| {
-                    region.sections[i].kind == SectionKind::Side
-                        && region.sections[j].kind == SectionKind::Side
-                });
-                let left_hl = if is_side_side { added_hl } else { removed_hl };
-
-                let (removed, added) = entry
-                    .diffs
-                    .get_or_insert_with(|| refine_diff(text, left, right));
-                spans.extend(removed.iter().map(|r| (left_hl, r.clone())));
-                spans.extend(added.iter().map(|r| (added_hl, r.clone())));
+            // Normalize: if show_base_pairs is set but no base comparison
+            // exists, fall through to single-pair mode.
+            if entry.show_base_pairs && !region.has_base_comparison() {
+                entry.show_base_pairs = false;
             }
+            let pair = entry.pair;
 
-            // Always-on: word-diff within each Diff section.
-            for section in &region.sections {
-                if section.kind == SectionKind::Diff {
-                    let (removed, added) = refine_diff_section(text, section);
+            // Pair-active suppresses always-on highlights.
+            // - show_base_pairs with adjacent SB pairs: pair-active (render SB pairs)
+            // - show_base_pairs with Diff sections only: not pair-active (let always-on render
+            //   the jj diff base comparison)
+            // - single pair: pair-active (render the pair)
+            // - no-highlight (pair >= num_pairs): pair-active (suppress everything — truly blank)
+            let pair_active = if entry.show_base_pairs && region.has_adjacent_side_base_pairs() {
+                true
+            } else if entry.show_base_pairs {
+                false
+            } else if pair >= num_pairs {
+                true
+            } else {
+                region.refine_pair_indices(pair).is_some()
+            };
+
+            if entry.show_base_pairs {
+                // Show adjacent (Side, Base) word-diffs simultaneously.
+                // Put Base on the left (old/removed) and Side on the right
+                // (new/added) so that red marks what Base had that Side
+                // removed, and blue marks what Side added relative to Base.
+                for (side, base) in region.adjacent_side_base_pairs() {
+                    let left = (
+                        region.sections[base].content_start,
+                        region.sections[base].content_end,
+                    );
+                    let right = (
+                        region.sections[side].content_start,
+                        region.sections[side].content_end,
+                    );
+                    let (removed, added) = refine_diff(text, left, right);
                     spans.extend(removed.iter().map(|r| (removed_hl, r.clone())));
+                    spans.extend(added.iter().map(|r| (added_hl, r.clone())));
+                }
+            } else if let Some((left, right)) = conflict_pair_sections(region, pair) {
+                let left_section = region
+                    .sections
+                    .iter()
+                    .find(|s| s.content_start == left.0)
+                    .unwrap();
+                let right_section = region
+                    .sections
+                    .iter()
+                    .find(|s| s.content_start == right.0)
+                    .unwrap();
+
+                if left_section.kind == SectionKind::Side && right_section.kind == SectionKind::Diff
+                {
+                    // Side–Diff: word-diff Side (plain text) vs Their (resolved
+                    // from Diff), showing unique words on each section in green.
+                    let (side_ranges, diff_ranges) =
+                        refine_side_diff_added(text, left_section, right_section);
+                    spans.extend(side_ranges.iter().map(|r| (added_hl, r.clone())));
+                    spans.extend(diff_ranges.iter().map(|r| (added_hl, r.clone())));
+                } else {
+                    // Side–Side, Side–Base, or Diff–Diff: standard word-diff.
+                    // For side↔side pairs both sides are "added" — neither is
+                    // conceptually "removed" in a conflict.
+                    let is_side_side = left_section.kind == SectionKind::Side
+                        && right_section.kind == SectionKind::Side;
+                    let left_hl = if is_side_side { added_hl } else { removed_hl };
+
+                    let (removed, added) = entry
+                        .diffs
+                        .get_or_insert_with(|| refine_diff(text, left, right));
+                    spans.extend(removed.iter().map(|r| (left_hl, r.clone())));
                     spans.extend(added.iter().map(|r| (added_hl, r.clone())));
                 }
             }
 
-            // Always-on: word-diff each Side section against resolved base from Diff.
-            let side_added = entry.side_added.get_or_insert_with(|| {
-                region
-                    .sections
-                    .iter()
-                    .map(|s| {
-                        if s.kind == SectionKind::Side {
-                            region
-                                .sections
-                                .iter()
-                                .find(|d| d.kind == SectionKind::Diff)
-                                .and_then(|diff| {
-                                    let base = resolve_diff_content_base(text, diff);
-                                    if !base.is_empty() {
-                                        Some(refine_side_with_base(text, s, &base))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            });
-            for (section_idx, section) in region.sections.iter().enumerate() {
-                if section.kind == SectionKind::Side {
-                    if let Some(added) = side_added.get(section_idx) {
+            // Always-on: word-diff within each Diff section.
+            if !pair_active {
+                for section in &region.sections {
+                    if section.kind == SectionKind::Diff {
+                        let (removed, added) = refine_diff_section(text, section);
+                        spans.extend(removed.iter().map(|r| (removed_hl, r.clone())));
                         spans.extend(added.iter().map(|r| (added_hl, r.clone())));
+                    }
+                }
+            }
+
+            // Always-on: word-diff each Side section against resolved base from Diff.
+            // Suppressed when any pair is active for the same reason.
+            if !pair_active {
+                let side_added = entry.side_added.get_or_insert_with(|| {
+                    region
+                        .sections
+                        .iter()
+                        .map(|s| {
+                            if s.kind == SectionKind::Side {
+                                region
+                                    .sections
+                                    .iter()
+                                    .find(|d| d.kind == SectionKind::Diff)
+                                    .and_then(|diff| {
+                                        let base = resolve_diff_content_base(text, diff);
+                                        if !base.is_empty() {
+                                            Some(refine_side_with_base(text, s, &base))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                });
+                for (section_idx, section) in region.sections.iter().enumerate() {
+                    if section.kind == SectionKind::Side {
+                        if let Some(added) = side_added.get(section_idx) {
+                            spans.extend(added.iter().map(|r| (added_hl, r.clone())));
+                        }
                     }
                 }
             }
