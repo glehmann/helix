@@ -63,6 +63,9 @@ pub struct ConflictRefineEntry {
     /// Cached word-diff results for the current `pair`:
     /// `(removed_ranges, added_ranges)`.
     pub diffs: Option<RefineDiffs>,
+    /// Cached added-word ranges for Side sections vs resolved Diff base.
+    /// Indexed by section position in the region. `None` = not computed yet.
+    pub side_added: Option<Vec<Vec<Range<usize>>>>,
 }
 
 /// Per-conflict word-diff refine state, keyed by [`ConflictRegion::start`].
@@ -71,29 +74,36 @@ pub struct ConflictRefineEntry {
 /// was inside a conflict before the edit.
 pub type ConflictCache = HashMap<usize, ConflictRefineEntry>;
 
-/// Whether a section holds one side of a conflict or the common base.
+/// Whether a section holds one side of a conflict, a common base, or a
+/// jj unified-diff side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionKind {
     /// A `+++++++` side (jj format) or the current/incoming sides (git format).
     Side,
     /// A `-------` base (jj format) or the `|||||||` base (git diff3 format).
     Base,
+    /// A `%%%%%%%` diff side (jj format) — a unified diff against the merge base.
+    Diff,
 }
 
 /// One section within a conflict region.
 ///
 /// For git format the first section's `marker_start` equals the `<<<<<<<` line;
-/// for jj format every section starts with its own `+++++++` / `-------` marker.
+/// for jj format every section starts with its own `+++++++` / `-------` / `%%%%%%%` marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
     pub kind: SectionKind,
-    /// Char index of the first character of this section's marker line.
+    /// Char index of the first character of this section's first marker line.
     ///
     /// For the first side of a git-format conflict this is the `<<<<<<<` line.
-    /// For jj-format sections this is the `+++++++` or `-------` line.
+    /// For jj-format sections this is the `+++++++`, `-------`, or `%%%%%%%` line.
     /// For the last side of a git-format conflict this is the `=======` line.
     pub marker_start: usize,
-    /// Char index of the first content character (the line *after* the marker).
+    /// How many consecutive marker lines this section has (1 for most, 2 for
+    /// a `%%%%%%%` Diff section whose second line is `\\\\\\`).
+    pub marker_lines: usize,
+    /// Char index of the first content character (the line *after* the last
+    /// marker line).  For `Diff` sections this is after the `\\\\\\` continuation.
     pub content_start: usize,
     /// Exclusive end of the content (= `marker_start` of next section, or `end`
     /// of the whole conflict for the final section).
@@ -127,7 +137,9 @@ impl ConflictRegion {
 
         // Phase 1
         for i in 1..n {
-            if i == 1 || self.sections[i - 1].kind == SectionKind::Base {
+            if (i == 1 || self.sections[i - 1].kind == SectionKind::Base)
+                && self.sections[i].kind != SectionKind::Diff
+            {
                 count += 1;
             }
         }
@@ -166,7 +178,8 @@ impl ConflictRegion {
 
         // Phase 1: (0,1) first, then all (i,i+1) where sections[i] is Base.
         for i in 1..n {
-            let in_phase1 = i == 1 || self.sections[i - 1].kind == SectionKind::Base;
+            let in_phase1 = (i == 1 || self.sections[i - 1].kind == SectionKind::Base)
+                && self.sections[i].kind != SectionKind::Diff;
             if in_phase1 {
                 if idx == pair {
                     return Some((i - 1, i));
@@ -210,6 +223,7 @@ pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
     struct PartialSection {
         kind: SectionKind,
         marker_start: usize,
+        marker_lines: usize,
         content_start: usize,
     }
 
@@ -218,6 +232,7 @@ pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
             Section {
                 kind: self.kind,
                 marker_start: self.marker_start,
+                marker_lines: self.marker_lines,
                 content_start: self.content_start,
                 content_end,
             }
@@ -266,6 +281,7 @@ pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
                         current: PartialSection {
                             kind: SectionKind::Side,
                             marker_start: line_char_start,
+                            marker_lines: 1,
                             content_start: next_line_start,
                         },
                         format: ConflictFormat::Git,
@@ -278,7 +294,7 @@ pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
             State::InConflict {
                 start,
                 mut sections,
-                current,
+                mut current,
                 format,
             } => {
                 if is_marker('|') {
@@ -289,6 +305,7 @@ pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
                         current: PartialSection {
                             kind: SectionKind::Base,
                             marker_start: line_char_start,
+                            marker_lines: 1,
                             content_start: next_line_start,
                         },
                         format,
@@ -301,6 +318,7 @@ pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
                         current: PartialSection {
                             kind: SectionKind::Side,
                             marker_start: line_char_start,
+                            marker_lines: 1,
                             content_start: next_line_start,
                         },
                         format,
@@ -323,6 +341,7 @@ pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
                         current: PartialSection {
                             kind: SectionKind::Side,
                             marker_start: line_char_start,
+                            marker_lines: 1,
                             content_start: next_line_start,
                         },
                         format: ConflictFormat::Git,
@@ -346,9 +365,36 @@ pub fn find_conflicts(text: &Rope) -> Vec<ConflictRegion> {
                         current: PartialSection {
                             kind,
                             marker_start: line_char_start,
+                            marker_lines: 1,
                             content_start: next_line_start,
                         },
                         format: ConflictFormat::Jj,
+                    }
+                } else if is_marker('%') {
+                    if current.content_start < line_char_start {
+                        sections.push(current.finish(line_char_start));
+                    }
+                    State::InConflict {
+                        start,
+                        sections,
+                        current: PartialSection {
+                            kind: SectionKind::Diff,
+                            marker_start: line_char_start,
+                            marker_lines: 1,
+                            content_start: next_line_start,
+                        },
+                        format: ConflictFormat::Jj,
+                    }
+                } else if is_marker('\\') {
+                    if current.kind == SectionKind::Diff {
+                        current.content_start = next_line_start;
+                        current.marker_lines = 2;
+                    }
+                    State::InConflict {
+                        start,
+                        sections,
+                        current,
+                        format,
                     }
                 } else {
                     State::InConflict {
@@ -453,10 +499,10 @@ pub fn conflict_marker_lines(conflicts: &[ConflictRegion], text: &Rope) -> Vec<u
         .iter()
         .flat_map(|region| {
             // Section marker lines (includes the opening <<<<<<< via sections[0].marker_start).
-            let section_lines = region
-                .sections
-                .iter()
-                .map(|s| text.char_to_line(s.marker_start));
+            let section_lines = region.sections.iter().flat_map(|s| {
+                let first = text.char_to_line(s.marker_start);
+                (0..s.marker_lines).map(move |i| first + i)
+            });
             // Closing >>>>>>> line — `end` is exclusive and points past the trailing
             // newline, so subtract 1 to land somewhere on the last line.
             let end_line = std::iter::once(text.char_to_line(region.end.saturating_sub(1)));
@@ -505,9 +551,50 @@ pub fn all_sides_content(text: &Rope, region: &ConflictRegion) -> String {
     region
         .sections
         .iter()
-        .filter(|s| s.kind == SectionKind::Side)
-        .map(|s| text.slice(s.content_start..s.content_end).to_string())
+        .filter(|s| s.kind != SectionKind::Base)
+        .map(|s| match s.kind {
+            SectionKind::Diff => resolve_diff_content(text, s),
+            _ => text.slice(s.content_start..s.content_end).to_string(),
+        })
         .collect()
+}
+
+/// Strip unified-diff markers from a Diff section, producing the
+/// side content (`+` and `   ` lines kept, `-` lines dropped).
+pub fn resolve_diff_content(text: &Rope, section: &Section) -> String {
+    let mut result = String::new();
+    for line in text
+        .slice(section.content_start..section.content_end)
+        .lines()
+    {
+        let line_str = line.to_string();
+        let first = line_str.chars().next();
+        match first {
+            Some('-') => {}
+            Some('+') | Some(' ') => result.push_str(&line_str[1..]),
+            _ => result.push_str(&line_str),
+        }
+    }
+    result
+}
+
+/// Strip unified-diff markers from a Diff section, producing the
+/// base content (`-` and `   ` lines kept, `+` lines dropped).
+pub fn resolve_diff_content_base(text: &Rope, section: &Section) -> String {
+    let mut result = String::new();
+    for line in text
+        .slice(section.content_start..section.content_end)
+        .lines()
+    {
+        let line_str = line.to_string();
+        let first = line_str.chars().next();
+        match first {
+            Some('+') => {}
+            Some('-') | Some(' ') => result.push_str(&line_str[1..]),
+            _ => result.push_str(&line_str),
+        }
+    }
+    result
 }
 
 // ── Refine (word-level diff) ──────────────────────────────────────────────────
@@ -726,6 +813,106 @@ fn refine_matches(
     refined
 }
 
+/// A word-token source for lines in a Diff section matching a specific prefix.
+///
+/// Only lines whose first character equals `prefix` (typically `'-'` or `'+'`)
+/// are tokenized; the prefix character itself is skipped.  Positions are
+/// recorded as byte offsets into the original document.
+struct DiffSectionWords<'a> {
+    text: &'a Rope,
+    positions: Vec<(usize, usize)>,
+}
+
+impl<'a> DiffSectionWords<'a> {
+    fn new(text: &'a Rope, section: &Section, prefix: char) -> Self {
+        let mut positions = Vec::new();
+        let content = text.slice(section.content_start..section.content_end);
+        let mut offset = section.content_start;
+        for line in content.lines() {
+            let line_len = line.len_chars();
+            let first = line.chars().next();
+            if first == Some(prefix) {
+                let mut tok_start: Option<usize> = None;
+                for (i, ch) in line.chars().enumerate() {
+                    let pos = offset + i;
+                    if i == 0 {
+                        continue;
+                    }
+                    if ch.is_whitespace() {
+                        if let Some(s) = tok_start.take() {
+                            positions.push((s, pos));
+                        }
+                    } else if tok_start.is_none() {
+                        tok_start = Some(pos);
+                    }
+                }
+                if let Some(s) = tok_start {
+                    positions.push((s, offset + line_len));
+                }
+            }
+            offset += line_len;
+        }
+        Self { text, positions }
+    }
+}
+
+impl<'a> imara_diff::TokenSource for DiffSectionWords<'a> {
+    type Token = String;
+    type Tokenizer = Box<dyn Iterator<Item = String> + 'a>;
+
+    fn tokenize(&self) -> Self::Tokenizer {
+        let text = self.text;
+        let positions = self.positions.clone();
+        Box::new(
+            positions
+                .into_iter()
+                .map(move |(s, e)| text.slice(s..e).chars().collect()),
+        )
+    }
+
+    fn estimate_tokens(&self) -> u32 {
+        self.positions.len() as u32
+    }
+}
+
+/// Run word-level diff between `-` lines and `+` lines within a Diff section.
+///
+/// Returns `(removed_ranges, added_ranges)` with byte positions in the
+/// original document.  Context lines (` ` prefix) are ignored.
+pub fn refine_diff_section(
+    text: &Rope,
+    section: &Section,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let removed_tokens = DiffSectionWords::new(text, section, '-');
+    let added_tokens = DiffSectionWords::new(text, section, '+');
+
+    let removed_positions = removed_tokens.positions.clone();
+    let added_positions = added_tokens.positions.clone();
+
+    let input = InternedInput::new(removed_tokens, added_tokens);
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+
+    let mut removed: Vec<Range<usize>> = Vec::new();
+    let mut added: Vec<Range<usize>> = Vec::new();
+
+    for hunk in diff.hunks() {
+        for &(s, e) in &removed_positions[hunk.before.start as usize..hunk.before.end as usize] {
+            match removed.last_mut() {
+                Some(r) if r.end == s => r.end = e,
+                _ => removed.push(s..e),
+            }
+        }
+        for &(s, e) in &added_positions[hunk.after.start as usize..hunk.after.end as usize] {
+            match added.last_mut() {
+                Some(r) if r.end == s => r.end = e,
+                _ => added.push(s..e),
+            }
+        }
+    }
+
+    (removed, added)
+}
+
 /// Compute a jj-style multi-level diff between two sections of `text`.
 ///
 /// First diffs by lines, then refines changed regions at word granularity,
@@ -767,6 +954,100 @@ pub fn refine_diff(
     }
 
     (removed, added)
+}
+
+// ── String-backed word tokens for base-vs-side word-diff ───────────────────────
+
+/// A word-token source backed by a `&str`.
+///
+/// Tokens are non-whitespace runs of characters.  Positions are byte offsets
+/// in the string.  Used as the left (base) side of a word-diff against a
+/// Side section in the rope.
+struct StringWordTokens<'a> {
+    text: &'a str,
+    positions: Vec<(usize, usize)>,
+}
+
+impl<'a> StringWordTokens<'a> {
+    fn new(text: &'a str) -> Self {
+        let mut positions = Vec::new();
+        let mut tok_start: Option<usize> = None;
+        for (i, ch) in text.char_indices() {
+            if ch.is_whitespace() {
+                if let Some(s) = tok_start.take() {
+                    positions.push((s, i));
+                }
+            } else if tok_start.is_none() {
+                tok_start = Some(i);
+            }
+        }
+        if let Some(s) = tok_start {
+            positions.push((s, text.len()));
+        }
+        Self { text, positions }
+    }
+}
+
+impl<'a> imara_diff::TokenSource for StringWordTokens<'a> {
+    type Token = String;
+    type Tokenizer = Box<dyn Iterator<Item = String> + 'a>;
+
+    fn tokenize(&self) -> Self::Tokenizer {
+        let text = self.text;
+        let positions = self.positions.clone();
+        Box::new(
+            positions
+                .into_iter()
+                .map(move |(s, e)| text[s..e].to_string()),
+        )
+    }
+
+    fn estimate_tokens(&self) -> u32 {
+        self.positions.len() as u32
+    }
+}
+
+/// Word-diff a Side section against a resolved base string.
+///
+/// Returns char-index ranges in the original rope for words that appear in
+/// the Side section but not in the base content (added words).  Removed
+/// words (present in base, not in Side) are not returned.
+pub fn refine_side_with_base(
+    text: &Rope,
+    side_section: &Section,
+    base_content: &str,
+) -> Vec<Range<usize>> {
+    let side_str = text
+        .slice(side_section.content_start..side_section.content_end)
+        .to_string();
+
+    let left_tokens = StringWordTokens::new(base_content);
+    let right_tokens = StringWordTokens::new(&side_str);
+
+    let right_positions = right_tokens.positions.clone();
+
+    let input = InternedInput::new(left_tokens, right_tokens);
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+
+    let mut added_byte: Vec<Range<usize>> = Vec::new();
+    for hunk in diff.hunks() {
+        for &(s, e) in &right_positions[hunk.after.start as usize..hunk.after.end as usize] {
+            match added_byte.last_mut() {
+                Some(r) if r.end == s => r.end = e,
+                _ => added_byte.push(s..e),
+            }
+        }
+    }
+
+    // Map byte offsets in side_str to char offsets in the rope.
+    added_byte
+        .into_iter()
+        .map(|range| {
+            let start = side_section.content_start + side_str[..range.start].chars().count();
+            let end = side_section.content_start + side_str[..range.end].chars().count();
+            start..end
+        })
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -977,6 +1258,64 @@ mod tests {
         assert_eq!(c.num_refine_pairs(), 6);
     }
 
+    #[test]
+    fn jj_diff_format() {
+        let text = concat!(
+            "<<<<<<< conflict 1 of 1\n",
+            "%%%%%%% diff from: vpxusssl 38d49363 \"merge base\"\n",
+            "\\\\\\\\\\\\\\        to: rtsqusxu 2768b0b9 \"commit A\"\n",
+            " apple\n",
+            "-grape\n",
+            "+grapefruit\n",
+            " orange\n",
+            "+++++++ ysrnknol 7a20f389 \"commit B\"\n",
+            "APPLE\n",
+            "GRAPE\n",
+            "ORANGE\n",
+            ">>>>>>> conflict 1 of 1 ends\n",
+        );
+        let r = rope(text);
+        let conflicts = find_conflicts(&r);
+        assert_eq!(conflicts.len(), 1);
+        let c = &conflicts[0];
+        assert_eq!(c.sections.len(), 2);
+        assert_eq!(c.sections[0].kind, SectionKind::Diff);
+        assert_eq!(c.sections[0].marker_lines, 2);
+        assert_eq!(
+            r.slice(c.sections[0].content_start..c.sections[0].content_end)
+                .to_string(),
+            " apple\n-grape\n+grapefruit\n orange\n"
+        );
+        assert_eq!(
+            r.slice(c.sections[0].marker_start..c.sections[0].content_start)
+                .to_string(),
+            "%%%%%%% diff from: vpxusssl 38d49363 \"merge base\"\n\\\\\\\\\\\\\\        to: rtsqusxu 2768b0b9 \"commit A\"\n"
+        );
+        assert_eq!(c.sections[1].kind, SectionKind::Side);
+        assert_eq!(c.sections[1].marker_lines, 1);
+    }
+
+    #[test]
+    fn jj_snapshot_section_content() {
+        let text = concat!(
+            "<<<<<<< Conflict\n",
+            "+++++++ s1\n",
+            "hello\n",
+            "------- base\n",
+            "world\n",
+            "+++++++ s2\n",
+            "rust\n",
+            ">>>>>>> Conflict ends\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let (s, e) = (c.sections[0].content_start, c.sections[0].content_end);
+        assert_eq!(r.slice(s..e).to_string(), "hello\n");
+        let (s, e) = (c.sections[1].content_start, c.sections[1].content_end);
+        assert_eq!(r.slice(s..e).to_string(), "world\n");
+        let (s, e) = (c.sections[2].content_start, c.sections[2].content_end);
+        assert_eq!(r.slice(s..e).to_string(), "rust\n");
+    }
     // ── conflict_at ───────────────────────────────────────────────────────────
 
     #[test]
@@ -1128,6 +1467,28 @@ mod tests {
             }
             assert_eq!(c.refine_pair_indices(pairs.len()), None);
         }
+    }
+
+    #[test]
+    fn refine_pairs_side_diff() {
+        // (Side, Diff) — no refine pairs, Diff is self-contained
+        let text = concat!(
+            "<<<<<<< conflict 1 of 1\n",
+            "+++++++ side\n",
+            "content\n",
+            "%%%%%%% diff from: base\n",
+            "\\\\\\\\\\\\\\        to: side\n",
+            " base\n",
+            "-old\n",
+            "+new\n",
+            ">>>>>>> conflict 1 of 1 ends\n",
+        );
+        let c = &find_conflicts(&rope(text))[0];
+        assert_eq!(c.sections.len(), 2);
+        assert_eq!(c.sections[0].kind, SectionKind::Side);
+        assert_eq!(c.sections[1].kind, SectionKind::Diff);
+        assert_eq!(c.num_refine_pairs(), 0);
+        assert_eq!(c.refine_pair_indices(0), None);
     }
 
     #[test]
@@ -1615,5 +1976,190 @@ mod tests {
         // at line → word → nonword levels.
         assert_eq!(rem_text, "current");
         assert_eq!(add_text, "incoming");
+    }
+
+    // ── refine_diff_section ────────────────────────────────────────────────────
+
+    #[test]
+    fn refine_diff_section_identical() {
+        let text = concat!(
+            "<<<<<<<\n",
+            "+++++++ side\n",
+            "content\n",
+            "%%%%%%%\n",
+            "\\\\\\\\\\\\\\\n",
+            " same\n",
+            " unchanged\n",
+            ">>>>>>>\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let section = &c.sections[1];
+        assert_eq!(section.kind, SectionKind::Diff);
+        let (removed, added) = refine_diff_section(&r, section);
+        assert!(removed.is_empty());
+        assert!(added.is_empty());
+    }
+
+    #[test]
+    fn refine_diff_section_single_word_change() {
+        let text = concat!(
+            "<<<<<<<\n",
+            "+++++++ side\n",
+            "content\n",
+            "%%%%%%%\n",
+            "\\\\\\\\\\\\\\\n",
+            "-            \"duplicated commits\",\n",
+            "+            \"duplicated revisions\",\n",
+            ">>>>>>>\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let section = &c.sections[1];
+        assert_eq!(section.kind, SectionKind::Diff);
+        let (removed, added) = refine_diff_section(&r, section);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(added.len(), 1);
+        assert!(r.slice(removed[0].clone()).to_string().contains("commits"));
+        assert!(r.slice(added[0].clone()).to_string().contains("revisions"));
+    }
+
+    #[test]
+    fn refine_diff_section_context_ignored() {
+        // Context lines (` ` prefix) should not contribute to the diff.
+        let text = concat!(
+            "<<<<<<<\n",
+            "+ side\n",
+            "%%%%%%%\n",
+            "\\\\\\\\\\\\\\\n",
+            "-old\n",
+            " context\n",
+            "+new\n",
+            ">>>>>>>\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let section = &c.sections[1];
+        assert_eq!(section.kind, SectionKind::Diff);
+        let (removed, added) = refine_diff_section(&r, section);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(added.len(), 1);
+        assert_eq!(r.slice(removed[0].clone()).to_string(), "old");
+        assert_eq!(r.slice(added[0].clone()).to_string(), "new");
+    }
+
+    // ── resolve_diff_content / resolve_diff_content_base ────────────────────────
+
+    #[test]
+    fn test_resolve_diff_content_side() {
+        let text = concat!(
+            "<<<<<<<\n+++++++ side\ncontent\n%%%%%%%\n\\\\\\\\\\\\\\\n",
+            " apple\n-grape\n+grapefruit\n orange\n",
+            ">>>>>>>\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let section = &c.sections[1];
+        assert_eq!(section.kind, SectionKind::Diff);
+        let resolved = resolve_diff_content(&r, section);
+        assert_eq!(resolved, "apple\ngrapefruit\norange\n");
+    }
+
+    #[test]
+    fn test_resolve_diff_content_base() {
+        let text = concat!(
+            "<<<<<<<\n+++++++ side\ncontent\n%%%%%%%\n\\\\\\\\\\\\\\\n",
+            "-old\n context\n+new\n",
+            ">>>>>>>\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let section = &c.sections[1];
+        assert_eq!(section.kind, SectionKind::Diff);
+        let resolved = resolve_diff_content_base(&r, section);
+        assert_eq!(resolved, "old\ncontext\n");
+    }
+
+    #[test]
+    fn test_resolve_diff_content_all_sides() {
+        // (Side, Diff) conflict: all_sides_content should resolve the Diff
+        let text = concat!(
+            "<<<<<<<\n+++++++ side\nside content\n%%%%%%%\n\\\\\\\\\\\\\\\n",
+            "-old\n+new\n",
+            ">>>>>>>\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let all = all_sides_content(&r, c);
+        assert!(all.contains("side content"));
+        assert!(!all.contains("-old"));
+        assert!(all.contains("new"));
+    }
+
+    // ── refine_side_with_base ──────────────────────────────────────────────────
+
+    #[test]
+    fn refine_side_added_words_basic() {
+        // (Side, Diff): Side = "hello world test", Diff shows base="hello world old"
+        // Added words in Side: "test"
+        let text = concat!(
+            "<<<<<<<\n+++++++ side\nhello world test\n%%%%%%%\n\\\\\\\\\\\\\\\n",
+            "-hello world old\n+hello world new\n",
+            ">>>>>>>\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let side = &c.sections[0];
+        assert_eq!(side.kind, SectionKind::Side);
+        let diff = &c.sections[1];
+        let base = resolve_diff_content_base(&r, diff);
+        let added = refine_side_with_base(&r, side, &base);
+        // "test" should be highlighted as added
+        assert!(!added.is_empty(), "expected added words");
+        for range in &added {
+            let word = r.slice(range.clone()).to_string();
+            assert!(word == "test", "unexpected added word: {word:?}");
+        }
+    }
+
+    #[test]
+    fn refine_side_no_added_words() {
+        // Side content matches the base (no change → no added words)
+        let text = concat!(
+            "<<<<<<<\n+++++++ side\nhello world\n%%%%%%%\n\\\\\\\\\\\\\\\n",
+            " hello world\n",
+            ">>>>>>>\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let side = &c.sections[0];
+        let diff = &c.sections[1];
+        let base = resolve_diff_content_base(&r, diff);
+        assert_eq!(base, "hello world\n");
+        let added = refine_side_with_base(&r, side, &base);
+        assert!(added.is_empty(), "expected no added words, got {added:?}");
+    }
+
+    #[test]
+    fn refine_side_all_words_added() {
+        // Everything in Side is new vs base
+        let text = concat!(
+            "<<<<<<<\n+++++++ side\nbrand new content\n%%%%%%%\n\\\\\\\\\\\\\\\n",
+            "-no\n+yes\n",
+            ">>>>>>>\n",
+        );
+        let r = rope(text);
+        let c = &find_conflicts(&r)[0];
+        let side = &c.sections[0];
+        let diff = &c.sections[1];
+        let base = resolve_diff_content_base(&r, diff);
+        let added = refine_side_with_base(&r, side, &base);
+        // All three words are new
+        assert_eq!(added.len(), 3, "expected 3 added words");
+        let words: Vec<String> = added
+            .iter()
+            .map(|range| r.slice(range.clone()).to_string())
+            .collect();
+        assert_eq!(words, vec!["brand", "new", "content"]);
     }
 }

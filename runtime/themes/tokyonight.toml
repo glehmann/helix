@@ -59,6 +59,8 @@ variable = { fg = "fg" }
 "diff.plus" = { fg = "add" }
 "diff.conflict.removed"  = { bg = "#662644" }
 "diff.conflict.added"    = { bg = "#005572" }
+"diff.conflict.diff_removed" = { bg = "#3a152e" }
+"diff.conflict.diff_added"   = { bg = "#002840" }
 "diff.conflict.marker"   = { bg = "#1f242e" }
 "diff.conflict.current"  = { bg = "#092334" }
 "diff.conflict.base"     = { bg = "#1e2025" }

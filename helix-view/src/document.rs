@@ -1534,7 +1534,11 @@ impl Document {
                 if let Some(idx) = conflict_at(&self.conflict_regions, cursor) {
                     cache
                         .entry(self.conflict_regions[idx].start)
-                        .or_insert_with(|| ConflictRefineEntry { pair, diffs: None });
+                        .or_insert_with(|| ConflictRefineEntry {
+                            pair,
+                            diffs: None,
+                            side_added: None,
+                        });
                 }
             }
         }
