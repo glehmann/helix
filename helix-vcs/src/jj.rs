@@ -5,6 +5,7 @@
 //! Instead in case there *is* a diff to base ourselves on, we copy it to a tempfile or just use the
 //! current file if not.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -178,12 +179,14 @@ pub(crate) fn for_each_changed_file(
 
     anyhow::ensure!(out.status.success(), "`jj file list` executed but failed");
 
+    let mut conflicted = HashSet::new();
     for entry in split_double_slash(&out.stdout, true) {
         if entry.is_empty() {
             continue;
         }
 
         let path = make_pathbuf(entry);
+        conflicted.insert(path.clone());
 
         if !callback(Ok(FileChange::Conflict { path })) {
             return Ok(());
@@ -256,6 +259,11 @@ pub(crate) fn for_each_changed_file(
         let Some(change) = entry_to_change(entry) else {
             continue;
         };
+
+        // Skip files already reported as conflicted above
+        if conflicted.contains(change.path()) {
+            continue;
+        }
 
         if !callback(Ok(change)) {
             return Ok(());
