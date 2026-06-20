@@ -155,6 +155,7 @@ fn handle_document_change(
     prompt_if_modified: bool,
 ) {
     let scrolloff = editor.config().scrolloff;
+    let target_view_id = editor.get_synced_view_id(doc_id);
 
     let doc = doc_mut!(editor, &doc_id);
     let Some(path) = doc.path().map(Path::to_path_buf) else {
@@ -186,7 +187,7 @@ fn handle_document_change(
             editor.set_warning(msg);
         }
     } else {
-        let view = view_mut!(editor);
+        let view = view_mut!(editor, target_view_id);
         let trust_full = editor
             .workspace_trust
             .query(doc.workspace_root(), TrustQuery::Git)
@@ -238,32 +239,35 @@ fn prompt_reload_modified(compositor: &mut Compositor, doc_id: DocumentId, path_
         )),
         None,
         ui::completers::none,
-        move |cx, _input, event| match event {
-            PromptEvent::Validate => {
-                let scrolloff = cx.editor.config().scrolloff;
-                let doc = doc_mut!(cx.editor, &doc_id);
-                let view = view_mut!(cx.editor);
-                let trust_full = cx
-                    .editor
-                    .workspace_trust
-                    .query(doc.workspace_root(), TrustQuery::Git)
-                    .is_trusted();
-                match doc.reload(view, &cx.editor.diff_providers, trust_full) {
-                    Ok(_) => {
-                        view.ensure_cursor_in_view(doc, scrolloff);
-                        cx.editor.set_status(format!("{path_str} reloaded"));
-                    }
-                    Err(err) => {
-                        cx.editor
-                            .set_error(format!("{path_str} reload failed: {err}"));
+        move |cx, _input, event| {
+            match event {
+                PromptEvent::Validate => {
+                    let scrolloff = cx.editor.config().scrolloff;
+                    let target_view_id = cx.editor.get_synced_view_id(doc_id);
+                    let doc = doc_mut!(cx.editor, &doc_id);
+                    let view = view_mut!(cx.editor, target_view_id);
+                    let trust_full = cx
+                        .editor
+                        .workspace_trust
+                        .query(doc.workspace_root(), TrustQuery::Git)
+                        .is_trusted();
+                    match doc.reload(view, &cx.editor.diff_providers, trust_full) {
+                        Ok(_) => {
+                            view.ensure_cursor_in_view(doc, scrolloff);
+                            cx.editor.set_status(format!("{path_str} reloaded"));
+                        }
+                        Err(err) => {
+                            cx.editor
+                                .set_error(format!("{path_str} reload failed: {err}"));
+                        }
                     }
                 }
+                PromptEvent::Abort => {
+                    cx.editor
+                        .set_status(format!("{path_str} external changes ignored"));
+                }
+                PromptEvent::Update => {}
             }
-            PromptEvent::Abort => {
-                cx.editor
-                    .set_status(format!("{path_str} external changes ignored"));
-            }
-            PromptEvent::Update => {}
         },
     );
     compositor.push(Box::new(prompt));
