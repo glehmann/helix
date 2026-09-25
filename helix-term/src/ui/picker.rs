@@ -47,6 +47,7 @@ use helix_core::{
 use helix_view::{
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
+    input::{MouseEvent, MouseEventKind},
     theme::Style,
     view::ViewPosition,
     Document, DocumentId, Editor,
@@ -269,6 +270,10 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+    picker_area: Option<Rect>,
+    preview_area: Option<Rect>,
+    preview_offset: ViewPosition,
+    preview_cursor: Option<u32>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -394,6 +399,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            picker_area: None,
+            preview_area: None,
+            preview_offset: ViewPosition::default(),
+            preview_cursor: None,
         }
     }
 
@@ -472,6 +481,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 self.cursor = self.cursor.saturating_add(len).saturating_sub(amount) % len;
             }
         }
+        self.preview_cursor = None;
     }
 
     /// Move the cursor down by exactly one page. After the last page comes the first page.
@@ -487,6 +497,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     /// Move the cursor to the first entry
     pub fn to_start(&mut self) {
         self.cursor = 0;
+        self.preview_cursor = None;
     }
 
     /// Move the cursor to the last entry
@@ -496,6 +507,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .snapshot()
             .matched_item_count()
             .saturating_sub(1);
+        self.preview_cursor = None;
     }
 
     pub fn selection(&self) -> Option<&T> {
@@ -540,6 +552,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
         // If the query has meaningfully changed, reset the cursor to the top of the results.
         self.cursor = 0;
+        self.preview_cursor = None;
         // Have nucleo reparse each changed column.
         for (i, column) in self
             .columns
@@ -896,6 +909,9 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let inner = inner.inner(margin);
         BLOCK.render(area, surface);
 
+        let cursor = self.cursor;
+        let mut offset = self.preview_offset;
+        let reset_offset = self.preview_cursor != Some(cursor);
         if let Some((preview, range)) = self.get_preview(cx.editor) {
             let doc = match preview.document() {
                 Some(doc)
@@ -930,30 +946,32 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 }
             };
 
-            let mut offset = ViewPosition::default();
-            if let Some((start_line, end_line)) = range {
-                let height = end_line - start_line;
-                let text = doc.text().slice(..);
-                let start = text.line_to_char(start_line);
-                let middle = text.line_to_char(start_line + height / 2);
-                if height < inner.height as usize {
-                    let text_fmt = doc.text_format(inner.width, None);
-                    let annotations = TextAnnotations::default();
-                    (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
-                        text,
-                        middle,
-                        // align to middle
-                        -(inner.height as isize / 2),
-                        0,
-                        &text_fmt,
-                        &annotations,
-                    );
-                    if start < offset.anchor {
+            if reset_offset {
+                offset = ViewPosition::default();
+                if let Some((start_line, end_line)) = range {
+                    let height = end_line - start_line;
+                    let text = doc.text().slice(..);
+                    let start = text.line_to_char(start_line);
+                    let middle = text.line_to_char(start_line + height / 2);
+                    if height < inner.height as usize {
+                        let text_fmt = doc.text_format(inner.width, None);
+                        let annotations = TextAnnotations::default();
+                        (offset.anchor, offset.vertical_offset) = char_idx_at_visual_offset(
+                            text,
+                            middle,
+                            // align to middle
+                            -(inner.height as isize / 2),
+                            0,
+                            &text_fmt,
+                            &annotations,
+                        );
+                        if start < offset.anchor {
+                            offset.anchor = start;
+                            offset.vertical_offset = 0;
+                        }
+                    } else {
                         offset.anchor = start;
-                        offset.vertical_offset = 0;
                     }
-                } else {
-                    offset.anchor = start;
                 }
             }
 
@@ -1020,6 +1038,60 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 decorations,
             );
         }
+        self.preview_offset = offset;
+        self.preview_cursor = Some(cursor);
+    }
+
+    fn handle_mouse_event(&mut self, event: &MouseEvent, cx: &mut Context) -> EventResult {
+        let MouseEvent {
+            kind, column, row, ..
+        } = *event;
+        let contains = |area: Rect| {
+            column >= area.left()
+                && column < area.right()
+                && row >= area.top()
+                && row < area.bottom()
+        };
+        let direction = match kind {
+            MouseEventKind::ScrollUp => Direction::Backward,
+            MouseEventKind::ScrollDown => Direction::Forward,
+            _ => return EventResult::Consumed(None),
+        };
+
+        let offset = cx.editor.config().scroll_lines.unsigned_abs();
+        if self.picker_area.is_some_and(contains) {
+            self.move_by(offset as u32, direction);
+        } else if self.preview_area.is_some_and(contains) {
+            let mut preview_offset = self.preview_offset;
+            let preview_width = self
+                .preview_area
+                .expect("preview area was checked")
+                .width
+                .saturating_sub(4);
+            if let Some((preview, _)) = self.get_preview(cx.editor) {
+                if let Some(doc) = preview.document() {
+                    let text = doc.text().slice(..);
+                    let text_fmt = doc.text_format(preview_width, None);
+                    let annotations = TextAnnotations::default();
+                    let offset = match direction {
+                        Direction::Backward => -(offset as isize),
+                        Direction::Forward => offset as isize,
+                    };
+                    (preview_offset.anchor, preview_offset.vertical_offset) =
+                        char_idx_at_visual_offset(
+                            text,
+                            preview_offset.anchor,
+                            preview_offset.vertical_offset as isize + offset,
+                            0,
+                            &text_fmt,
+                            &annotations,
+                        );
+                }
+            }
+            self.preview_offset = preview_offset;
+        }
+
+        EventResult::Consumed(None)
     }
 }
 
@@ -1042,11 +1114,15 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         };
 
         let picker_area = area.with_width(picker_width);
+        self.picker_area = Some(picker_area);
         self.render_picker(picker_area, surface, cx);
 
         if render_preview {
             let preview_area = area.clip_left(picker_width);
+            self.preview_area = Some(preview_area);
             self.render_preview(preview_area, surface, cx);
+        } else {
+            self.preview_area = None;
         }
     }
 
@@ -1057,9 +1133,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             Event::Key(event) => *event,
             Event::Paste(..) => return self.prompt_handle_event(event, ctx),
             Event::Resize(..) => return EventResult::Consumed(None),
-            // Picker is a modal and should consume mouse events so clicks don't fall
-            // through to the editor underneath
-            Event::Mouse(_) => return EventResult::Consumed(None),
+            Event::Mouse(event) => return self.handle_mouse_event(event, ctx),
             _ => return EventResult::Ignored(None),
         };
 
