@@ -219,12 +219,12 @@ impl Watcher {
 
     /// Set extra paths to watch via polling.
     /// These are paths outside the main watched workspace that need change detection.
-    /// Only paths outside the workspace are added (paths inside are already watched).
+    /// Paths already covered by the recursive watcher are excluded. This retains VCS metadata
+    /// inside the workspace, such as Jujutsu's excluded `.jj/working_copy/checkout` marker.
     pub fn set_extra_watched_paths(&mut self, paths: Vec<PathBuf>) {
-        let (workspace, _) = helix_loader::find_workspace();
         self.extra_watched_paths = paths
             .into_iter()
-            .filter(|path| !path.starts_with(&workspace))
+            .filter(|path| !self.is_watching(path))
             .map(|path| {
                 let mtime = path.metadata().ok().and_then(|m| m.modified().ok());
                 (path, mtime)
@@ -594,8 +594,25 @@ fn is_vcs_ignore(path: &Path, watch_vcs: bool) -> bool {
     {
         return true;
     }
+    if path
+        .components()
+        .position(|component| component.as_os_str() == ".jj")
+        .is_some_and(|jj| {
+            let suffix: Vec<_> = path.components().skip(jj + 1).collect();
+            match suffix.as_slice() {
+                [] => false,
+                [working_copy] => working_copy.as_os_str() != "working_copy",
+                [working_copy, checkout] => {
+                    working_copy.as_os_str() != "working_copy" || checkout.as_os_str() != "checkout"
+                }
+                _ => true,
+            }
+        })
+    {
+        return true;
+    }
     match file_name(path) {
-        Some(".jj" | ".svn" | ".hg") => true,
+        Some(".svn" | ".hg") => true,
         Some(".git") => !watch_vcs,
         _ => false,
     }
@@ -616,7 +633,14 @@ mod tests {
         // but it IS caught by ignore_path_rec which checks ancestors recursively
         assert!(!is_vcs_ignore(Path::new(".git/foo/bar"), true));
         assert!(!is_vcs_ignore(Path::new(".foo"), true));
-        assert!(is_vcs_ignore(Path::new(".jj"), true));
+        assert!(!is_vcs_ignore(Path::new(".jj"), true));
+        assert!(!is_vcs_ignore(Path::new(".jj/working_copy"), true));
+        assert!(!is_vcs_ignore(Path::new(".jj/working_copy/checkout"), true));
+        assert!(is_vcs_ignore(
+            Path::new(".jj/working_copy/tree_state"),
+            true
+        ));
+        assert!(is_vcs_ignore(Path::new(".jj/repo"), true));
         assert!(is_vcs_ignore(Path::new(".svn"), true));
         assert!(is_vcs_ignore(Path::new(".hg"), true));
     }

@@ -220,7 +220,7 @@ fn handle_document_change(
             .workspace_trust
             .query(doc.workspace_root(), TrustQuery::Git)
             .is_trusted();
-        match doc.reload(view, &editor.diff_providers, trust_full) {
+        match doc.reload(view, &mut editor.diff_providers, trust_full) {
             Ok(_) => {
                 view.ensure_cursor_in_view(doc, scrolloff);
                 let msg = format!(
@@ -247,11 +247,7 @@ fn reload_vcs_diffs(editor: &mut Editor) {
         let Some(path) = doc.path() else {
             continue;
         };
-        let trust_full = editor
-            .workspace_trust
-            .query(doc.workspace_root(), TrustQuery::Git)
-            .is_trusted();
-        match editor.diff_providers.get_diff_base(path, trust_full) {
+        match editor.diff_providers.get_diff_base(path) {
             Some(diff_base) => doc.set_diff_base(diff_base),
             None => doc.diff_handle = None,
         }
@@ -279,7 +275,7 @@ fn prompt_reload_modified(compositor: &mut Compositor, doc_id: DocumentId, path_
                         .workspace_trust
                         .query(doc.workspace_root(), TrustQuery::Git)
                         .is_trusted();
-                    match doc.reload(view, &cx.editor.diff_providers, trust_full) {
+                    match doc.reload(view, &mut cx.editor.diff_providers, trust_full) {
                         Ok(_) => {
                             view.ensure_cursor_in_view(doc, scrolloff);
                             cx.editor.set_status(format!("{path_str} reloaded"));
