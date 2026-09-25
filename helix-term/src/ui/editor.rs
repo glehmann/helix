@@ -25,7 +25,7 @@ use helix_core::{
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
     document::{Mode, SCRATCH_BUFFER_NAME},
-    editor::{CompleteAction, CursorShapeConfig},
+    editor::{Action, BufferLine, CompleteAction, CursorShapeConfig},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
@@ -712,6 +712,61 @@ impl EditorView {
         }
     }
 
+    fn use_bufferline(editor: &Editor) -> bool {
+        matches!(editor.config().bufferline, BufferLine::Always)
+            || matches!(editor.config().bufferline, BufferLine::Multiple)
+                && editor.documents.len() > 1
+    }
+
+    fn bufferline_document_at(editor: &Editor, column: u16) -> Option<helix_view::DocumentId> {
+        let area = editor.tree.area();
+        let scratch = PathBuf::from(SCRATCH_BUFFER_NAME);
+        let mut x = area.left();
+
+        for doc in editor.documents() {
+            let fname = doc
+                .path()
+                .unwrap_or(&scratch)
+                .file_name()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or_default();
+            let text = format!(" {}{} ", fname, if doc.is_modified() { "[+]" } else { "" });
+            let right = x.saturating_add(text.width() as u16).min(area.right());
+            if column >= x && column < right {
+                return Some(doc.id());
+            }
+            x = right;
+            if x >= area.right() {
+                break;
+            }
+        }
+
+        None
+    }
+
+    fn switch_buffer(editor: &mut Editor, direction: Direction) {
+        let current = view!(editor).doc;
+        let id = match direction {
+            Direction::Forward => editor
+                .documents
+                .keys()
+                .cycle()
+                .skip_while(|id| *id != &current)
+                .nth(1),
+            Direction::Backward => editor
+                .documents
+                .keys()
+                .rev()
+                .cycle()
+                .skip_while(|id| *id != &current)
+                .nth(1),
+        }
+        .copied()
+        .expect("the current document is open");
+        editor.switch(id, Action::Replace);
+    }
+
     pub fn render_gutter<'d>(
         editor: &'d Editor,
         doc: &'d Document,
@@ -1217,6 +1272,28 @@ impl EditorView {
             ..
         } = *event;
 
+        if Self::use_bufferline(cxt.editor)
+            && row.checked_add(1) == Some(cxt.editor.tree.area().top())
+        {
+            match kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(id) = Self::bufferline_document_at(cxt.editor, column) {
+                        cxt.editor.switch(id, Action::Replace);
+                        return EventResult::Consumed(None);
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    Self::switch_buffer(cxt.editor, Direction::Backward);
+                    return EventResult::Consumed(None);
+                }
+                MouseEventKind::ScrollDown => {
+                    Self::switch_buffer(cxt.editor, Direction::Forward);
+                    return EventResult::Consumed(None);
+                }
+                _ => {}
+            }
+        }
+
         let pos_and_view = |editor: &Editor, row, column, ignore_virtual_text| {
             editor.tree.views().find_map(|(view, _focus)| {
                 view.pos_at_screen_coords(
@@ -1620,13 +1697,7 @@ impl Component for EditorView {
         surface.set_style(area, cx.editor.theme.get("ui.background"));
         let config = cx.editor.config();
 
-        // check if bufferline should be rendered
-        use helix_view::editor::BufferLine;
-        let use_bufferline = match config.bufferline {
-            BufferLine::Always => true,
-            BufferLine::Multiple if cx.editor.documents.len() > 1 => true,
-            _ => false,
-        };
+        let use_bufferline = Self::use_bufferline(cx.editor);
 
         // -1 for commandline and -1 for bufferline
         let mut editor_area = area.clip_bottom(1);
