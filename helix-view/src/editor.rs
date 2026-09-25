@@ -2356,6 +2356,19 @@ impl Editor {
         self.documents.values_mut()
     }
 
+    pub fn clear_diagnostics_for_language_server(&mut self, id: LanguageServerId) {
+        for diagnostics in self.diagnostics.values_mut() {
+            diagnostics.retain(|(_, provider)| provider.language_server_id() != Some(id));
+        }
+        self.diagnostics
+            .retain(|_, diagnostics| !diagnostics.is_empty());
+
+        for document in self.documents_mut() {
+            document.clear_diagnostics_for_language_server(id);
+            document.previous_diagnostic_ids.remove(&id);
+        }
+    }
+
     pub fn document_by_path<P: AsRef<Path>>(&self, path: P) -> Option<&Document> {
         self.documents()
             .find(|doc| doc.path().is_some_and(|p| p == path.as_ref()))
