@@ -457,10 +457,17 @@ impl WatchFilter {
     ) -> WatchFilter {
         let filesentry_ignores = IgnoreFiles::filesentry_ignores(workspace);
         let (global_ignores, workspace_ignore) = IgnoreFiles::shared_ignores(workspace, config);
-        let ignore_files = roots
+        let mut ignore_files = roots
             .chain([workspace])
             .map(|root| IgnoreFiles::new(workspace_ignore.clone(), config, root, &global_ignores))
-            .collect();
+            .collect::<Vec<_>>();
+        // `ignore_path` looks up the entry containing the path with
+        // `partition_point(|f| path < f.root)`, which finds the first entry
+        // whose root does not sort after the path. That requires the entries
+        // to be sorted from largest to smallest root; multiple roots (e.g. an
+        // LSP watcher root outside the workspace) otherwise make the lookup
+        // consult the wrong entry's ignore rules.
+        ignore_files.sort_by(|a, b| b.root.cmp(&a.root));
         WatchFilter {
             filesentry_ignores,
             ignore_files,
@@ -658,5 +665,40 @@ mod tests {
         assert!(filter.ignore_path_rec(Path::new("/repo/target/foo.rs"), Some(false)));
         assert!(filter.ignore_path_rec(Path::new("/repo/target/deep/foo.rs"), Some(false)));
         assert!(!filter.ignore_path_rec(Path::new("/repo/src/main.rs"), Some(false)));
+    }
+
+    /// With more than one watched root, each path must be checked against the
+    /// ignore rules of the entry containing it. An outside root (e.g. a Python
+    /// toolchain watched for an LSP) must not impose its ignore rules on
+    /// workspace paths; uv ships a gitignore with a bare `*` catch-all under
+    /// `~/.local/share/uv/python`, which used to swallow every event.
+    #[test]
+    fn watch_filter_lookup_selects_the_entry_containing_the_path() {
+        use std::sync::Arc;
+
+        use filesentry::Filter;
+        use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+        use crate::file_watcher::{Config, IgnoreFiles, WatchFilter};
+
+        let dir = tempfile::tempdir().unwrap();
+        let outer_lib = dir.path().join("outer/python/lib");
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&outer_lib).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Catch-all gitignore covering the toolchain tree, like uv's
+        // `~/.local/share/uv/python/.gitignore`.
+        std::fs::write(dir.path().join("outer/python/.gitignore"), "*").unwrap();
+
+        let config = Config::default();
+        let filter = WatchFilter::new(&config, &workspace, [outer_lib.as_path()].into_iter());
+
+        // Workspace paths resolve to the workspace entry; the outer entry's
+        // catch-all must not apply to them.
+        let probe = workspace.join(".jj/working_copy/checkout");
+        assert!(!filter.ignore_path(&probe, Some(false)));
+
+        // Paths under the outside root keep using that root's rules.
+        assert!(filter.ignore_path(&outer_lib.join("file"), Some(false)));
     }
 }

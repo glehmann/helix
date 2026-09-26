@@ -63,3 +63,4 @@ regex-cursor = "0.1.5"
 [dev-dependencies]
 quickcheck.workspace = true
 indoc = "2.0.6"
+tempfile.workspace = true

@@ -1573,6 +1573,7 @@ dependencies = [
  "slotmap",
  "smallvec",
  "smartstring",
+ "tempfile",
  "textwrap",
  "toml",
  "tree-house",
